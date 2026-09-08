@@ -1,4 +1,4 @@
-"""Separate-screen video window synchronized to a replay clock."""
+"""Separate-screen video window controlled by a ReplaySink adapter."""
 
 from __future__ import annotations
 
@@ -18,27 +18,29 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from replay_core import format_time_s
+from core.replay_core import format_time_s
 
 
 class VideoWindow(QMainWindow):
-    """A video-only window intended for a second display.
+    """Video-only second-screen window.
 
-    The supplied clock is the master. Video follows the clock rather than
-    becoming a separate timeline, which keeps the design ready for future LSL
-    synchronization.
+    This class encapsulates media-player details. It no longer depends directly
+    on ReplayClock; VideoReplaySink supplies session time, play state, and rate.
     """
 
-    def __init__(self, replay_clock, parent=None) -> None:
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Drive Replay Video")
         self.resize(960, 640)
 
-        self.clock = replay_clock
         self.video_path: Path | None = None
         self.offset_s = 0.0
+        self._session_time_s = 0.0
+        self._playing = False
+        self._rate = 1.0
         self._last_resync_wall = 0.0
         self._fullscreen = False
+        self._force_next_sync = True
 
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
@@ -65,10 +67,6 @@ class VideoWindow(QMainWindow):
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         footer.addWidget(self.fullscreen_button)
 
-        self.clock.timeChanged.connect(self._on_clock_time)
-        self.clock.playingChanged.connect(self._on_playing_changed)
-        self.clock.rateChanged.connect(self._on_rate_changed)
-
         self.player.errorOccurred.connect(self._on_player_error)
 
     def load_video(self, path: Path | str) -> None:
@@ -77,41 +75,30 @@ class VideoWindow(QMainWindow):
             raise FileNotFoundError(f"Video not found: {path}")
         self.video_path = path
         self.player.setSource(QUrl.fromLocalFile(str(path)))
-        self.player.setPlaybackRate(self.clock.rate)
-        self._seek_exact(self.clock.current_time_s)
-        self.time_label.setText(f"{path.name} — {format_time_s(self.clock.current_time_s)}")
+        self.player.setPlaybackRate(self._rate)
+        self.force_sync()
+        self.set_session_time(self._session_time_s)
+        self.time_label.setText(f"{path.name} — {format_time_s(self._session_time_s)}")
 
     def set_offset_s(self, offset_s: float) -> None:
-        # video position = replay session time + offset
         self.offset_s = float(offset_s)
+        self.force_sync()
         if self.video_path is not None:
-            self._seek_exact(self.clock.current_time_s)
+            self.set_session_time(self._session_time_s)
 
-    def _desired_position_ms(self, session_time_s: float) -> int:
-        return max(0, int(round((float(session_time_s) + self.offset_s) * 1000.0)))
-
-    def _seek_exact(self, session_time_s: float) -> None:
-        if self.video_path is None:
-            return
-        desired = self._desired_position_ms(session_time_s)
-        duration = self.player.duration()
-        if duration > 0:
-            desired = min(desired, duration)
-        self.player.setPosition(desired)
-
-    def _on_clock_time(self, session_time_s: float) -> None:
+    def set_session_time(self, session_time_s: float) -> None:
+        self._session_time_s = max(0.0, float(session_time_s))
         if self.video_path is None:
             return
 
-        desired = self._desired_position_ms(session_time_s)
+        desired = self._desired_position_ms(self._session_time_s)
         actual = self.player.position()
         now = time.monotonic()
 
-        # Paused/scrubbing should be exact. During normal playback, allow a
-        # small tolerance and resync at most twice per second to avoid stutter.
-        if not self.clock.playing:
-            if abs(actual - desired) > 25:
+        if self._force_next_sync or not self._playing:
+            if self._force_next_sync or abs(actual - desired) > 25:
                 self.player.setPosition(desired)
+            self._force_next_sync = False
         elif (
             abs(actual - desired) > 1000
             or (abs(actual - desired) > 180 and now - self._last_resync_wall >= 0.5)
@@ -120,20 +107,33 @@ class VideoWindow(QMainWindow):
             self._last_resync_wall = now
 
         self.time_label.setText(
-            f"{self.video_path.name} — session {format_time_s(session_time_s)}"
+            f"{self.video_path.name} — session {format_time_s(self._session_time_s)}"
         )
 
-    def _on_playing_changed(self, playing: bool) -> None:
+    def set_playing(self, playing: bool) -> None:
+        self._playing = bool(playing)
         if self.video_path is None:
             return
-        self._seek_exact(self.clock.current_time_s)
-        if playing:
+        self.force_sync()
+        self.set_session_time(self._session_time_s)
+        if self._playing:
             self.player.play()
         else:
             self.player.pause()
 
-    def _on_rate_changed(self, rate: float) -> None:
-        self.player.setPlaybackRate(float(rate))
+    def set_rate(self, rate: float) -> None:
+        self._rate = float(rate)
+        self.player.setPlaybackRate(self._rate)
+
+    def force_sync(self) -> None:
+        self._force_next_sync = True
+
+    def _desired_position_ms(self, session_time_s: float) -> int:
+        desired = max(0, int(round((float(session_time_s) + self.offset_s) * 1000.0)))
+        duration = self.player.duration()
+        if duration > 0:
+            desired = min(desired, duration)
+        return desired
 
     def _on_player_error(self, _error, error_string: str) -> None:
         self.time_label.setText(f"Video error: {error_string}")

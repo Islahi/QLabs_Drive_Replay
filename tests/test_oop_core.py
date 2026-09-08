@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from integrations.location_sources import QLabsQCarLocationSource
+from core.oop_interfaces import LocationReading, LocationSource, ReplaySink
+from integrations.qlabs_replay import QLabsReplaySink
+from core.recorder_core import RecorderWorker
+from core.replay_core import SessionData
+from integrations.replay_sinks import MapReplaySink, VideoReplaySink
+
+
+class FakeLocationSource(LocationSource):
+    def __init__(self) -> None:
+        self.index = 0
+        self.was_closed = False
+
+    @property
+    def name(self) -> str:
+        return "Fake source"
+
+    @property
+    def metadata(self) -> dict:
+        return {"kind": "fake"}
+
+    def connect(self) -> None:
+        pass
+
+    def read_position(self) -> LocationReading:
+        self.index += 1
+        return LocationReading(float(self.index), 2.0, 3.0)
+
+    def close(self) -> None:
+        self.was_closed = True
+
+
+class OOPArchitectureTests(unittest.TestCase):
+    def test_abstract_classes_cannot_be_instantiated(self) -> None:
+        with self.assertRaises(TypeError):
+            LocationSource()
+        with self.assertRaises(TypeError):
+            ReplaySink()
+
+    def test_concrete_classes_inherit_interfaces(self) -> None:
+        self.assertTrue(issubclass(QLabsQCarLocationSource, LocationSource))
+        self.assertTrue(issubclass(QLabsReplaySink, ReplaySink))
+        self.assertTrue(issubclass(MapReplaySink, ReplaySink))
+        self.assertTrue(issubclass(VideoReplaySink, ReplaySink))
+
+    def test_recorder_uses_polymorphic_location_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "session"
+            session_dir.mkdir()
+            source = FakeLocationSource()
+            worker = RecorderWorker(session_dir, source, sample_rate_hz=50.0)
+            worker.start()
+            time.sleep(0.13)
+            worker.stop()
+            worker.join(timeout=2.0)
+
+            state = worker.snapshot()
+            self.assertIsNone(state["error"])
+            self.assertGreaterEqual(state["sample_count"], 3)
+            self.assertTrue(source.was_closed)
+
+            session = SessionData.load(session_dir)
+            self.assertEqual(session.sample_count, state["sample_count"])
+            self.assertEqual(session.metadata["source"]["kind"], "fake")
+
+    def test_final_heading_does_not_reverse(self) -> None:
+        # Regression test for the final-sample yaw derivation.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir)
+            (session_dir / "session.json").write_text(
+                '{"format":"qlabs_drive_session","version":1,'
+                '"telemetry":{"file":"location.csv"}}',
+                encoding="utf-8",
+            )
+            (session_dir / "location.csv").write_text(
+                "time_s,x,y,z\n0,0,0,0\n1,1,0,0\n2,2,0,0\n3,3,0,0\n4,4,0,0\n",
+                encoding="utf-8",
+            )
+            session = SessionData.load(session_dir)
+            self.assertAlmostEqual(session.yaws[-1], 0.0, places=6)
+
+
+if __name__ == "__main__":
+    unittest.main()

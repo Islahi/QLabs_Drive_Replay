@@ -66,11 +66,12 @@ def write_json_atomic(path: Path, document: dict) -> None:
 
 def new_session_document(
     session_id: str,
-    host: str,
-    actor_number: int,
     requested_sample_rate_hz: float,
+    source_metadata: dict,
 ) -> dict:
-    return {
+    """Create session metadata without depending on a concrete source class."""
+    source_metadata = dict(source_metadata)
+    document = {
         "format": SESSION_FORMAT,
         "version": SESSION_VERSION,
         "workspace": "Open Road",
@@ -83,10 +84,7 @@ def new_session_document(
             "kind": "monotonic_seconds_from_recording_start",
             "column": "time_s",
         },
-        "qlabs": {
-            "host": host,
-            "source_actor_number": int(actor_number),
-        },
+        "source": source_metadata,
         "telemetry": {
             "file": "location.csv",
             "columns": ["time_s", "x", "y", "z"],
@@ -99,6 +97,15 @@ def new_session_document(
             "heading_source": "derived_from_consecutive_xy_samples",
         },
     }
+
+    # Preserve the convenient v1 QLabs metadata block when the active source
+    # is QLabs. Replay loading does not depend on this block.
+    if source_metadata.get("kind") == "qlabs_qcar2_world_transform":
+        document["qlabs"] = {
+            "host": source_metadata.get("host", "localhost"),
+            "source_actor_number": int(source_metadata.get("actor_number", 0)),
+        }
+    return document
 
 
 @dataclass(frozen=True)
@@ -250,10 +257,15 @@ class SessionData:
         window = 4
         for i in range(count):
             j = min(count - 1, i + window)
-            if j == i:
+            if j > i:
+                dx = self.xs[j] - self.xs[i]
+                dy = self.ys[j] - self.ys[i]
+            else:
+                # At the final sample, use the backward segment in the forward
+                # direction instead of accidentally reversing the heading.
                 j = max(0, i - window)
-            dx = self.xs[j] - self.xs[i]
-            dy = self.ys[j] - self.ys[i]
+                dx = self.xs[i] - self.xs[j]
+                dy = self.ys[i] - self.ys[j]
             if math.hypot(dx, dy) >= 0.05:
                 last_yaw = math.atan2(dy, dx)
             yaws[i] = last_yaw

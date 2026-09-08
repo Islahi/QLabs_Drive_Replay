@@ -1,8 +1,11 @@
-"""Interactive Open Road drive replay.
+"""Interactive Open Road drive replay with explicit OOP architecture.
 
 Main window: map + master replay timeline.
 Optional second window: synchronized video.
 Optional QLabs connection: transform-based replay QCar in Open Road.
+
+ReplayCoordinator talks to map/video/QLabs through ReplaySink, so the main
+window does not contain output-specific synchronization logic.
 """
 
 from __future__ import annotations
@@ -11,13 +14,11 @@ import argparse
 import math
 from pathlib import Path
 import sys
-import time
 
-from PySide6.QtCore import QPointF, Qt, QTimer, Signal, QObject
+from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QCursor, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -34,7 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from replay_core import (
+from core.replay_core import (
     PassCandidate,
     SessionData,
     extract_stable_completed_loop,
@@ -44,97 +45,16 @@ from replay_core import (
     offset_polyline_xy,
     rdp_simplify,
 )
-from qlabs_replay import QLabsReplayController
-from replay_video_window import VideoWindow
+from integrations.qlabs_replay import QLabsReplaySink
+from core.replay_clock import ReplayClock
+from core.replay_controller import ReplayCoordinator
+from integrations.replay_sinks import MapReplaySink, VideoReplaySink
+from ui.replay_video_window import VideoWindow
 
 LANE_WIDTH_M = 4.0
 MEDIAN_WIDTH_M = 0.25
 LOGGED_LANE_OFFSET_FROM_MEDIAN_M = MEDIAN_WIDTH_M / 2.0 + 1.5 * LANE_WIDTH_M
 TOTAL_APPROX_ROAD_WIDTH_M = 6.0 * LANE_WIDTH_M + MEDIAN_WIDTH_M
-
-
-class ReplayClock(QObject):
-    timeChanged = Signal(float)
-    playingChanged = Signal(bool)
-    rateChanged = Signal(float)
-    durationChanged = Signal(float)
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.current_time_s = 0.0
-        self.duration_s = 0.0
-        self.playing = False
-        self.rate = 1.0
-        self._anchor_wall = time.perf_counter()
-        self._anchor_time = 0.0
-
-        self.timer = QTimer(self)
-        self.timer.setInterval(16)
-        self.timer.timeout.connect(self._tick)
-        self.timer.start()
-
-    def set_duration(self, duration_s: float) -> None:
-        self.duration_s = max(0.0, float(duration_s))
-        self.current_time_s = min(self.current_time_s, self.duration_s)
-        self._reanchor()
-        self.durationChanged.emit(self.duration_s)
-        self.timeChanged.emit(self.current_time_s)
-
-    def seek(self, time_s: float) -> None:
-        self.current_time_s = max(0.0, min(float(time_s), self.duration_s))
-        self._reanchor()
-        self.timeChanged.emit(self.current_time_s)
-
-    def play(self) -> None:
-        if self.duration_s <= 0:
-            return
-        if self.current_time_s >= self.duration_s:
-            self.current_time_s = 0.0
-            self.timeChanged.emit(self.current_time_s)
-        if not self.playing:
-            self.playing = True
-            self._reanchor()
-            self.playingChanged.emit(True)
-
-    def pause(self) -> None:
-        if self.playing:
-            self._update_from_wall()
-            self.playing = False
-            self.playingChanged.emit(False)
-
-    def toggle(self) -> None:
-        self.pause() if self.playing else self.play()
-
-    def set_rate(self, rate: float) -> None:
-        rate = max(0.05, min(float(rate), 8.0))
-        if self.playing:
-            self._update_from_wall()
-        self.rate = rate
-        self._reanchor()
-        self.rateChanged.emit(rate)
-
-    def _reanchor(self) -> None:
-        self._anchor_wall = time.perf_counter()
-        self._anchor_time = self.current_time_s
-
-    def _update_from_wall(self) -> None:
-        if self.playing:
-            self.current_time_s = self._anchor_time + (
-                time.perf_counter() - self._anchor_wall
-            ) * self.rate
-            self.current_time_s = max(0.0, min(self.current_time_s, self.duration_s))
-
-    def _tick(self) -> None:
-        if not self.playing:
-            return
-        self._update_from_wall()
-        if self.current_time_s >= self.duration_s:
-            self.current_time_s = self.duration_s
-            self.timeChanged.emit(self.current_time_s)
-            self.playing = False
-            self.playingChanged.emit(False)
-            return
-        self.timeChanged.emit(self.current_time_s)
 
 
 class ReplayMap(QWidget):
@@ -352,18 +272,21 @@ class ReplayMap(QWidget):
 
 
 class ReplayWindow(QMainWindow):
+    """Presentation layer for the replay system.
+
+    ReplayWindow handles user interaction only. ReplayCoordinator owns
+    synchronization and broadcasts state to ReplaySink implementations.
+    """
+
     def __init__(self, reference_path: Path, reference_loop: list[list[float]]) -> None:
         super().__init__()
-        self.setWindowTitle("QLabs Open Road Drive Replay")
+        self.setWindowTitle("QLabs Open Road Drive Replay — OOP")
         self.resize(1320, 820)
 
         self.reference_path = reference_path
         self.session: SessionData | None = None
         self.clock = ReplayClock(self)
-        self.qlabs = QLabsReplayController()
-        self.video_window = VideoWindow(self.clock)
-        self._last_qlabs_send_wall = 0.0
-        self._force_qlabs_send = False
+        self.coordinator = ReplayCoordinator(self.clock, self)
         self._slider_dragging = False
         self._resume_after_drag = False
 
@@ -390,11 +313,22 @@ class ReplayWindow(QMainWindow):
         self.reset_map_button.clicked.connect(self.map_widget.reset_view)
         outer.addWidget(self.map_widget, 1)
 
+        # All replay outputs share the ReplaySink interface.
+        self.map_sink = MapReplaySink(self.map_widget)
+        self.qlabs_sink = QLabsReplaySink(minimum_update_period_s=0.05)
+        self.video_window = VideoWindow()
+        self.video_sink = VideoReplaySink(self.video_window)
+        self.coordinator.add_sink(self.map_sink)
+        self.coordinator.add_sink(self.qlabs_sink)
+        self.coordinator.add_sink(self.video_sink)
+
         transport = QHBoxLayout()
         outer.addLayout(transport)
 
         self.back_button = QPushButton("−1 s")
-        self.back_button.clicked.connect(lambda: self.clock.seek(self.clock.current_time_s - 1.0))
+        self.back_button.clicked.connect(
+            lambda: self.clock.seek(self.clock.current_time_s - 1.0)
+        )
         transport.addWidget(self.back_button)
 
         self.play_button = QPushButton("Play")
@@ -402,7 +336,9 @@ class ReplayWindow(QMainWindow):
         transport.addWidget(self.play_button)
 
         self.forward_button = QPushButton("+1 s")
-        self.forward_button.clicked.connect(lambda: self.clock.seek(self.clock.current_time_s + 1.0))
+        self.forward_button.clicked.connect(
+            lambda: self.clock.seek(self.clock.current_time_s + 1.0)
+        )
         transport.addWidget(self.forward_button)
 
         self.timeline = QSlider(Qt.Orientation.Horizontal)
@@ -416,7 +352,13 @@ class ReplayWindow(QMainWindow):
         transport.addWidget(self.time_label)
 
         self.rate_combo = QComboBox()
-        for label, value in [("0.25×", 0.25), ("0.5×", 0.5), ("1×", 1.0), ("2×", 2.0), ("4×", 4.0)]:
+        for label, value in [
+            ("0.25×", 0.25),
+            ("0.5×", 0.5),
+            ("1×", 1.0),
+            ("2×", 2.0),
+            ("4×", 4.0),
+        ]:
             self.rate_combo.addItem(label, value)
         self.rate_combo.setCurrentIndex(2)
         self.rate_combo.currentIndexChanged.connect(
@@ -430,7 +372,6 @@ class ReplayWindow(QMainWindow):
         self.position_label = QLabel("X —   Y —   Z —")
         lower.addWidget(self.position_label, 1)
 
-        # QLabs replay controls.
         lower.addWidget(QLabel("QLabs:"))
         self.host_edit = QLineEdit("localhost")
         self.host_edit.setMaximumWidth(130)
@@ -474,7 +415,7 @@ class ReplayWindow(QMainWindow):
         self.video_offset_spin.setToolTip(
             "video_position = replay_time + offset. Positive means the session starts later in the video."
         )
-        self.video_offset_spin.valueChanged.connect(self.video_window.set_offset_s)
+        self.video_offset_spin.valueChanged.connect(self.video_sink.set_offset_s)
         video_row.addWidget(self.video_offset_spin)
 
         self.status_label = QLabel(
@@ -483,9 +424,10 @@ class ReplayWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         outer.addWidget(self.status_label)
 
-        self.clock.timeChanged.connect(self.on_clock_time)
         self.clock.playingChanged.connect(self.on_playing_changed)
         self.clock.durationChanged.connect(self.on_duration_changed)
+        self.coordinator.poseChanged.connect(self.on_pose_changed)
+        self.coordinator.sinkError.connect(self.on_sink_error)
 
     def choose_session(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose recorded session folder")
@@ -499,13 +441,11 @@ class ReplayWindow(QMainWindow):
             QMessageBox.critical(self, "Could not load session", str(exc))
             return
 
-        self.clock.pause()
         self.session = session
-        self.map_widget.set_session(session)
-        self.clock.set_duration(session.duration_s)
-        self.clock.seek(0.0)
+        self.coordinator.set_session(session)
         self.session_label.setText(
-            f"{session.folder.name} — {session.sample_count:,} samples — {format_time_s(session.duration_s)}"
+            f"{session.folder.name} — {session.sample_count:,} samples — "
+            f"{format_time_s(session.duration_s)}"
         )
         self.status_label.setText(f"Loaded session: {session.folder}")
 
@@ -515,7 +455,7 @@ class ReplayWindow(QMainWindow):
             candidate = session.folder / str(video_meta["file"])
             if candidate.is_file():
                 try:
-                    self.video_window.load_video(candidate)
+                    self.video_sink.load_video(candidate)
                     self.video_path_edit.setText(str(candidate))
                     self.video_offset_spin.setValue(float(video_meta.get("offset_s", 0.0)))
                 except Exception:
@@ -527,12 +467,12 @@ class ReplayWindow(QMainWindow):
     def on_playing_changed(self, playing: bool) -> None:
         self.play_button.setText("Pause" if playing else "Play")
 
-    def on_clock_time(self, time_s: float) -> None:
+    def on_pose_changed(self, time_s: float, pose) -> None:
         if self.session is None:
             return
-        pose = self.session.pose_at(time_s)
-        self.map_widget.set_current_pose(pose)
-        self.position_label.setText(f"X {pose.x:.3f}   Y {pose.y:.3f}   Z {pose.z:.3f}")
+        self.position_label.setText(
+            f"X {pose.x:.3f}   Y {pose.y:.3f}   Z {pose.z:.3f}"
+        )
         self.time_label.setText(
             f"{format_time_s(time_s)} / {format_time_s(self.session.duration_s)}"
         )
@@ -541,15 +481,8 @@ class ReplayWindow(QMainWindow):
             self.timeline.setValue(int(round(time_s * 1000.0)))
             self.timeline.blockSignals(False)
 
-        if self.qlabs.connected:
-            now = time.monotonic()
-            if self._force_qlabs_send or now - self._last_qlabs_send_wall >= 0.05:
-                try:
-                    self.qlabs.update_pose(pose.x, pose.y, pose.z, pose.yaw_rad, wait=False)
-                    self._last_qlabs_send_wall = now
-                    self._force_qlabs_send = False
-                except Exception as exc:
-                    self.status_label.setText(f"QLabs replay update failed: {exc}")
+    def on_sink_error(self, sink_name: str, message: str) -> None:
+        self.status_label.setText(f"{sink_name} replay update failed: {message}")
 
     def on_slider_pressed(self) -> None:
         self._slider_dragging = True
@@ -560,9 +493,9 @@ class ReplayWindow(QMainWindow):
         self.clock.seek(value / 1000.0)
 
     def on_slider_released(self) -> None:
+        self.coordinator.force_sync()
         self.clock.seek(self.timeline.value() / 1000.0)
         self._slider_dragging = False
-        self._force_qlabs_send = True
         if self._resume_after_drag:
             self.clock.play()
         self._resume_after_drag = False
@@ -595,11 +528,13 @@ class ReplayWindow(QMainWindow):
                 f"Pass {number}: {format_time_s(candidate.time_s)}   "
                 f"({candidate.distance_m:.1f} m from click)"
             )
-            action.triggered.connect(lambda _checked=False, c=candidate: self.seek_candidate(c))
+            action.triggered.connect(
+                lambda _checked=False, c=candidate: self.seek_candidate(c)
+            )
         menu.exec(QCursor.pos())
 
     def seek_candidate(self, candidate: PassCandidate) -> None:
-        self._force_qlabs_send = True
+        self.coordinator.force_sync()
         self.clock.seek(candidate.time_s)
         self.status_label.setText(
             f"Jumped to {format_time_s(candidate.time_s)} — recorded point "
@@ -607,41 +542,41 @@ class ReplayWindow(QMainWindow):
         )
 
     def toggle_qlabs(self) -> None:
-        if self.qlabs.connected:
-            self.qlabs.disconnect(destroy_spawned=True)
+        if self.qlabs_sink.connected:
+            self.qlabs_sink.disconnect(destroy_spawned=True)
             self.qlabs_button.setText("Connect Replay")
             self.status_label.setText("QLabs replay disconnected.")
             return
 
-        if self.session is None:
+        pose = self.coordinator.current_pose()
+        if pose is None:
             QMessageBox.information(self, "Load session", "Load a recorded session first.")
             return
-        pose = self.session.pose_at(self.clock.current_time_s)
         try:
-            mode = self.qlabs.connect(
+            mode = self.qlabs_sink.connect(
                 host=self.host_edit.text().strip() or "localhost",
                 actor_number=self.actor_spin.value(),
                 initial_location=[pose.x, pose.y, pose.z],
                 initial_yaw_rad=pose.yaw_rad,
             )
+            self.coordinator.sync_now()
         except Exception as exc:
             QMessageBox.critical(self, "QLabs replay connection failed", str(exc))
             return
         self.qlabs_button.setText("Disconnect Replay")
-        self._force_qlabs_send = True
         self.status_label.setText(
             f"QLabs replay connected; actor {self.actor_spin.value()} was {mode}. "
             "Open Road should already be loaded in QLabs."
         )
 
     def possess_trailing(self) -> None:
-        self._possess(self.qlabs.possess_trailing, "trailing")
+        self._possess(self.qlabs_sink.possess_trailing, "trailing")
 
     def possess_overhead(self) -> None:
-        self._possess(self.qlabs.possess_overhead, "overhead")
+        self._possess(self.qlabs_sink.possess_overhead, "overhead")
 
     def possess_front(self) -> None:
-        self._possess(self.qlabs.possess_front, "front")
+        self._possess(self.qlabs_sink.possess_front, "front")
 
     def _possess(self, fn, label: str) -> None:
         try:
@@ -660,9 +595,10 @@ class ReplayWindow(QMainWindow):
         if not path:
             return
         try:
-            self.video_window.load_video(Path(path))
+            self.video_sink.load_video(Path(path))
             self.video_path_edit.setText(path)
-            self.video_window.set_offset_s(self.video_offset_spin.value())
+            self.video_sink.set_offset_s(self.video_offset_spin.value())
+            self.coordinator.sync_now()
             self.video_window.show()
         except Exception as exc:
             QMessageBox.critical(self, "Could not load video", str(exc))
@@ -678,26 +614,38 @@ class ReplayWindow(QMainWindow):
             event.accept()
             return
         if event.key() == Qt.Key.Key_Left:
+            self.coordinator.force_sync()
             self.clock.seek(self.clock.current_time_s - 1.0)
             event.accept()
             return
         if event.key() == Qt.Key.Key_Right:
+            self.coordinator.force_sync()
             self.clock.seek(self.clock.current_time_s + 1.0)
             event.accept()
             return
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
-        self.clock.pause()
-        self.qlabs.disconnect(destroy_spawned=True)
-        self.video_window.close()
+        self.coordinator.close()
         super().closeEvent(event)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Interactive QLabs Open Road drive replay.")
-    parser.add_argument("--session", type=Path, default=None, help="Recorded session folder")
-    parser.add_argument("--reference", type=Path, default=None, help="open_road_reference.json path")
+    parser = argparse.ArgumentParser(
+        description="Interactive QLabs Open Road drive replay."
+    )
+    parser.add_argument(
+        "--session",
+        type=Path,
+        default=None,
+        help="Recorded session folder",
+    )
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        default=None,
+        help="open_road_reference.json path",
+    )
     return parser.parse_args()
 
 
