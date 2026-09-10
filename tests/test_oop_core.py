@@ -70,6 +70,23 @@ class OOPArchitectureTests(unittest.TestCase):
             self.assertEqual(session.sample_count, state["sample_count"])
             self.assertEqual(session.metadata["source"]["kind"], "fake")
 
+
+    def test_v2_preserves_obs_aligned_time_and_recorded_yaw(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir)
+            (session_dir / "session.json").write_text(
+                '{"format":"qlabs_drive_session","version":2,'
+                '"telemetry":{"file":"location.csv"}}',
+                encoding="utf-8",
+            )
+            (session_dir / "location.csv").write_text(
+                "time_s,x,y,z,yaw_rad\n0.250,0,0,1,1.25\n0.300,1,0,1,1.30\n",
+                encoding="utf-8",
+            )
+            session = SessionData.load(session_dir)
+            self.assertAlmostEqual(session.times[0], 0.250, places=6)
+            self.assertAlmostEqual(session.yaws[0], 1.25, places=6)
+
     def test_final_heading_does_not_reverse(self) -> None:
         # Regression test for the final-sample yaw derivation.
         with tempfile.TemporaryDirectory() as temp_dir:

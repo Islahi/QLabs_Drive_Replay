@@ -1,200 +1,151 @@
-# QLabs Drive Replay v2 — Grouped OOP Architecture
+# QLabs Drive Replay — synchronized recorder + two-window reviewer
 
-This version keeps the v2 OOP design but groups the source files by responsibility so the project structure mirrors the architecture.
+This repository keeps the existing grouped OOP design and adds synchronized
+experiment recording **inside the existing recorder/replay codebase**.
 
-## Project layout
+## Current workflow
 
-```text
-QLabs_Drive_Replay_v2_OOP_grouped/
-├── apps/
-│   ├── __init__.py
-│   ├── location_recorder.py
-│   └── open_road_replay.py
-│
-├── core/
-│   ├── __init__.py
-│   ├── oop_interfaces.py
-│   ├── recorder_core.py
-│   ├── replay_clock.py
-│   ├── replay_controller.py
-│   └── replay_core.py
-│
-├── integrations/
-│   ├── __init__.py
-│   ├── location_sources.py
-│   ├── qlabs_replay.py
-│   └── replay_sinks.py
-│
-├── ui/
-│   ├── __init__.py
-│   └── replay_video_window.py
-│
-├── data/
-│   └── open_road_reference.json
-│
-├── recordings/
-│   └── .gitkeep
-│
-├── docs/
-│   └── OOP_ARCHITECTURE.md
-│
-├── scripts/
-│   ├── run_recorder.bat
-│   └── run_replay.bat
-│
-├── tests/
-│   └── test_oop_core.py
-│
-├── requirements.txt
-├── run_recorder.py
-├── run_replay.py
-├── run_recorder.bat
-└── run_replay.bat
-```
+### Recorder: one button
 
-## Folder responsibilities
-
-### `apps/`
-Application entry-point GUI code.
-
-- `location_recorder.py` — recorder window
-- `open_road_replay.py` — map/timeline replay window
-
-### `core/`
-Application-independent logic and OOP contracts.
-
-- `oop_interfaces.py` — `LocationSource` and `ReplaySink` abstract classes
-- `recorder_core.py` — timestamped recording engine
-- `replay_core.py` — session model, interpolation, map geometry
-- `replay_clock.py` — master replay clock
-- `replay_controller.py` — polymorphic replay coordinator
-
-### `integrations/`
-Adapters to external systems or concrete replay/recording endpoints.
-
-- `location_sources.py` — QLabs QCar recording source
-- `qlabs_replay.py` — QLabs replay sink
-- `replay_sinks.py` — map/video replay adapters
-
-This is also the natural folder for future LSL implementations.
-
-### `ui/`
-Reusable presentation components.
-
-- `replay_video_window.py` — second-screen video window
-
-### `data/`
-Static reference data.
-
-- `open_road_reference.json` — measured Open Road XYZ reference
-
-### `recordings/`
-Generated session folders.
-
-### `docs/`
-Architecture/documentation.
-
-### `scripts/`
-Convenience OS launch scripts.
-
-### `tests/`
-Automated tests.
-
-## Quick start
-
-From the project root:
-
-### Recorder
+Run:
 
 ```bash
 python run_recorder.py
 ```
 
-or double-click:
+Prepare QLabs Open Road with the target QCar already present, and prepare an OBS
+scene that captures the QLabs application window. OBS WebSocket must be enabled.
 
-```text
-run_recorder.bat
-```
+Press **START SESSION** once. The recorder then:
 
-### Replay
+1. connects to the selected QCar in QLabs;
+2. forces the QLabs application view to the QCar **front CSI camera**;
+3. connects to OBS WebSocket and starts OBS recording;
+4. estimates video `t=0` from OBS's reported recording duration;
+5. records unfiltered QCar telemetry at the requested rate (default 20 Hz);
+6. optionally records left/right/rear QLabs CSI cameras to separate MP4 files;
+7. writes OBS/video clock correlation data for replay synchronization.
+
+Press the same button again (**STOP SESSION**) to stop and finalize everything.
+
+The recorder refuses to start a synchronized session if OBS is already
+recording, because it would not know where the experiment video begins.
+
+### Replay: exactly two active windows
+
+Run:
 
 ```bash
 python run_replay.py
 ```
 
-or double-click:
+The current reviewer intentionally opens only:
+
+1. **Map + timeline window**
+2. **Video window**
+
+There is **no QLabs replay UI** in this version. The old integration module is
+left dormant so a small optional third QLabs replay window can be added later
+without changing the session format.
+
+When a synchronized session is loaded, the video window automatically discovers
+available sources such as:
+
+- QLabs Front (OBS)
+- Left CSI
+- Right CSI
+- Rear CSI
+
+Switching camera keeps the same experiment time. Clicking a recorded location on
+the map seeks to the corresponding time; multiple visits to the same location
+are presented as separate pass candidates.
+
+## Recording output
+
+A typical session is:
 
 ```text
-run_replay.bat
+recordings/
+└── 2026-09-10_090000_participant_001/
+    ├── session.json
+    ├── location.csv
+    ├── obs_sync.csv
+    ├── csi_left.mp4
+    ├── csi_left_frames.csv
+    ├── csi_right.mp4
+    ├── csi_right_frames.csv
+    ├── csi_rear.mp4
+    └── csi_rear_frames.csv
 ```
 
-The launchers keep the grouped package structure hidden from the normal user workflow.
+The OBS recording normally remains in the OBS recording directory. Its absolute
+path is stored in `session.json`. If you later copy that video into the session
+folder, the reviewer also searches there by filename.
 
-## OOP structure
+## Synchronization model
 
-The architecture remains:
+Session v2 timestamps are referenced to the estimated first OBS-recorded frame.
+They are **not normalized to the first telemetry sample** during replay.
+
+`obs_sync.csv` records:
 
 ```text
-LocationSource <<abstract>>
-        ↑
-QLabsQCarLocationSource
-        ↓
-RecorderWorker
+session_time_s,obs_duration_s,...
 ```
 
-and:
+Side-camera timestamp files record:
 
 ```text
-ReplaySink <<abstract>>
-      ↑        ↑        ↑
-      │        │        │
- MapReplay   QLabs    VideoReplay
-   Sink      Replay      Sink
-             Sink
-      \        |        /
-       \       |       /
-        ReplayCoordinator
-               ↓
-          ReplayClock
+frame_index,video_time_s,session_time_s,...
 ```
 
-The folder grouping now reinforces the same responsibilities:
+The video window interpolates these mappings, so OBS and QLabs CSI recordings
+can stay aligned to the same replay timeline even if capture starts slightly
+later or the clocks drift slightly over a long experiment.
+
+## Project layout
 
 ```text
-core/          abstractions + domain logic
-integrations/  concrete external implementations
-apps/          top-level application coordination/UI
-ui/            reusable windows/widgets
+QLabs_Drive_Replay/
+├── apps/
+│   ├── location_recorder.py
+│   └── open_road_replay.py
+├── core/
+│   ├── oop_interfaces.py
+│   ├── recorder_core.py
+│   ├── replay_clock.py
+│   ├── replay_controller.py
+│   └── replay_core.py
+├── integrations/
+│   ├── location_sources.py
+│   ├── recording_services.py
+│   ├── replay_sinks.py
+│   └── qlabs_replay.py          # dormant/future, not shown in current UI
+├── ui/
+│   └── replay_video_window.py
+├── data/
+│   └── open_road_reference.json
+└── recordings/
 ```
 
 ## Requirements
 
 - Python 3.10+
 - PySide6
-- Quanser QLabs Python `qvl` package for recording/direct replay
+- Quanser QLabs Python `qvl` package
+- OBS Studio with OBS WebSocket enabled
+- `obsws-python`
+- OpenCV + NumPy for optional left/right/rear video capture
 
-Install dependencies as needed:
+Install the pip dependencies with:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Tests
+## Recommended first validation
 
-From the project root:
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-## Future LSL integration
-
-Future LSL classes can be grouped under `integrations/`, for example:
-
-```text
-integrations/
-├── lsl_location_source.py
-└── lsl_event_replay_sink.py
-```
-
-They can inherit the existing abstractions without modifying the recorder or replay coordinator.
+Do a 1–2 minute test before a full experiment. Drive past a recognizable point,
+stop the session, open it in the reviewer, click that point, then switch between
+Front/Left/Right/Rear in the video window and check that the same moment is
+shown across the available recordings.

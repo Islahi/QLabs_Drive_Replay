@@ -62,14 +62,31 @@ class QLabsQCarLocationSource(LocationSource):
         if not self.connected:
             raise RuntimeError("QLabs location source is not connected.")
 
-        status, location, _rotation, _scale = self._qcar.get_world_transform()
+        status, location, rotation, _scale = self._qcar.get_world_transform()
         if not status or len(location) < 3:
             return None
 
         x, y, z = map(float, location[:3])
         if not all(math.isfinite(value) for value in (x, y, z)):
             return None
-        return LocationReading(x=x, y=y, z=z)
+
+        roll = pitch = yaw = None
+        if rotation is not None and len(rotation) >= 3:
+            candidate = tuple(map(float, rotation[:3]))
+            if all(math.isfinite(value) for value in candidate):
+                roll, pitch, yaw = candidate
+
+        return LocationReading(
+            x=x, y=y, z=z,
+            roll_rad=roll, pitch_rad=pitch, yaw_rad=yaw,
+        )
+
+    def possess_front_camera(self) -> None:
+        """Make the QLabs application window show this QCar's front CSI view."""
+        if not self.connected:
+            raise RuntimeError("QLabs location source is not connected.")
+        if not self._qcar.possess(self._qcar.CAMERA_CSI_FRONT):
+            raise RuntimeError("QLabs could not possess the QCar2 front CSI camera.")
 
     def close(self) -> None:
         if self._qlabs is not None:

@@ -21,11 +21,19 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class LocationReading:
-    """One valid position measurement from a location source."""
+    """One valid QCar pose measurement from a location source.
+
+    Rotation fields are optional so existing/mock XYZ-only sources remain
+    compatible. Recorder code stores them when the concrete source provides
+    them.
+    """
 
     x: float
     y: float
     z: float
+    roll_rad: float | None = None
+    pitch_rad: float | None = None
+    yaw_rad: float | None = None
 
 
 class LocationSource(ABC):
@@ -56,7 +64,7 @@ class LocationSource(ABC):
 
     @abstractmethod
     def read_position(self) -> LocationReading | None:
-        """Return a valid XYZ sample, or None when this sample is unavailable."""
+        """Return a valid pose sample, or None when this sample is unavailable."""
         raise NotImplementedError
 
     @abstractmethod

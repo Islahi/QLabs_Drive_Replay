@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 SESSION_FORMAT = "qlabs_drive_session"
-SESSION_VERSION = 1
+SESSION_VERSION = 2
 DEFAULT_SAMPLE_RATE_HZ = 20.0
 
 
@@ -81,18 +81,26 @@ def new_session_document(
         "recording_started_utc": None,
         "finished_utc": None,
         "timebase": {
-            "kind": "monotonic_seconds_from_recording_start",
+            "kind": "obs_aligned_monotonic_seconds",
             "column": "time_s",
+            "description": (
+                "Seconds from the estimated first OBS-recorded video frame. "
+                "Telemetry may begin slightly after t=0 while startup completes."
+            ),
         },
         "source": source_metadata,
         "telemetry": {
             "file": "location.csv",
-            "columns": ["time_s", "x", "y", "z"],
+            "columns": [
+                "time_s", "scheduled_time_s", "x", "y", "z",
+                "roll_rad", "pitch_rad", "yaw_rad", "valid"
+            ],
             "requested_sample_rate_hz": float(requested_sample_rate_hz),
             "sample_count": 0,
             "dropped_samples": 0,
             "duration_s": 0.0,
         },
+        "videos": {},
         "replay": {
             "heading_source": "derived_from_consecutive_xy_samples",
         },
@@ -138,6 +146,7 @@ class SessionData:
         xs: list[float],
         ys: list[float],
         zs: list[float],
+        recorded_yaws: list[float | None] | None = None,
     ) -> None:
         if not times:
             raise ValueError("The recording contains no valid location samples.")
@@ -150,7 +159,14 @@ class SessionData:
         self.xs = xs
         self.ys = ys
         self.zs = zs
-        self.yaws = self._derive_yaws()
+        derived = self._derive_yaws()
+        if recorded_yaws is None or len(recorded_yaws) != len(times):
+            self.yaws = derived
+        else:
+            self.yaws = [
+                derived[i] if value is None or not math.isfinite(value) else float(value)
+                for i, value in enumerate(recorded_yaws)
+            ]
 
     @classmethod
     def load(cls, path: Path | str) -> "SessionData":
@@ -188,6 +204,7 @@ class SessionData:
         xs: list[float] = []
         ys: list[float] = []
         zs: list[float] = []
+        recorded_yaws: list[float | None] = []
 
         with csv_path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -205,6 +222,8 @@ class SessionData:
                     x = float(row["x"])
                     y = float(row["y"])
                     z = float(row["z"])
+                    yaw_raw = row.get("yaw_rad")
+                    yaw = None if yaw_raw in (None, "") else float(yaw_raw)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"Invalid telemetry value on CSV row {row_number}.") from exc
 
@@ -217,24 +236,31 @@ class SessionData:
                 if t == last_time and times:
                     # Keep the latest sample for an exactly duplicated timestamp.
                     xs[-1], ys[-1], zs[-1] = x, y, z
+                    recorded_yaws[-1] = yaw
                     continue
 
                 times.append(t)
                 xs.append(x)
                 ys.append(y)
                 zs.append(z)
+                recorded_yaws.append(yaw)
                 last_time = t
 
         if not times:
             raise ValueError("Telemetry CSV has no valid samples.")
 
-        # Replay always starts at 0. If an external source wrote a small non-zero
-        # first timestamp, normalize it without changing the sample spacing.
-        first_time = times[0]
-        if abs(first_time) > 1e-9:
-            times = [t - first_time for t in times]
+        # Legacy v1 sessions defined t=0 as the first telemetry sample, so keep
+        # that behavior for old recordings. v2 sessions are aligned to the OBS
+        # video timebase and must preserve their original timestamps.
+        if int(metadata.get("version", 1)) <= 1:
+            first_time = times[0]
+            if abs(first_time) > 1e-9:
+                times = [t - first_time for t in times]
 
-        return cls(session_json.parent, metadata, times, xs, ys, zs)
+        return cls(
+            session_json.parent, metadata, times, xs, ys, zs,
+            recorded_yaws=recorded_yaws,
+        )
 
     @property
     def sample_count(self) -> int:

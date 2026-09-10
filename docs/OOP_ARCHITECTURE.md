@@ -192,7 +192,7 @@ core/oop_interfaces.py        abstract contracts
 core/replay_clock.py          master replay clock
 core/replay_controller.py     synchronization coordinator
 integrations/replay_sinks.py          map/video adapters
-integrations/qlabs_replay.py          QLabs replay sink
+integrations/qlabs_replay.py          QLabs replay sink (dormant/future)
 apps/open_road_replay.py      map UI / user interaction
 ui/replay_video_window.py   video UI
 apps/location_recorder.py     recorder UI

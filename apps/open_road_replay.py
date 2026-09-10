@@ -1,11 +1,11 @@
 """Interactive Open Road drive replay with explicit OOP architecture.
 
 Main window: map + master replay timeline.
-Optional second window: synchronized video.
-Optional QLabs connection: transform-based replay QCar in Open Road.
+Second window: synchronized recorded video.
 
-ReplayCoordinator talks to map/video/QLabs through ReplaySink, so the main
-window does not contain output-specific synchronization logic.
+QLabs transform replay is intentionally not exposed in this version. The
+ReplayCoordinator synchronizes only the map and video windows for now; a small
+third QLabs replay window can be attached later without changing session files.
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSlider,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -45,7 +44,6 @@ from core.replay_core import (
     offset_polyline_xy,
     rdp_simplify,
 )
-from integrations.qlabs_replay import QLabsReplaySink
 from core.replay_clock import ReplayClock
 from core.replay_controller import ReplayCoordinator
 from integrations.replay_sinks import MapReplaySink, VideoReplaySink
@@ -313,13 +311,12 @@ class ReplayWindow(QMainWindow):
         self.reset_map_button.clicked.connect(self.map_widget.reset_view)
         outer.addWidget(self.map_widget, 1)
 
-        # All replay outputs share the ReplaySink interface.
+        # The active replay has exactly two outputs: map + recorded video.
+        # QLabs transform replay is intentionally dormant for now.
         self.map_sink = MapReplaySink(self.map_widget)
-        self.qlabs_sink = QLabsReplaySink(minimum_update_period_s=0.05)
         self.video_window = VideoWindow()
         self.video_sink = VideoReplaySink(self.video_window)
         self.coordinator.add_sink(self.map_sink)
-        self.coordinator.add_sink(self.qlabs_sink)
         self.coordinator.add_sink(self.video_sink)
 
         transport = QHBoxLayout()
@@ -371,36 +368,15 @@ class ReplayWindow(QMainWindow):
 
         self.position_label = QLabel("X —   Y —   Z —")
         lower.addWidget(self.position_label, 1)
-
-        lower.addWidget(QLabel("QLabs:"))
-        self.host_edit = QLineEdit("localhost")
-        self.host_edit.setMaximumWidth(130)
-        lower.addWidget(self.host_edit)
-        self.actor_spin = QSpinBox()
-        self.actor_spin.setRange(0, 1_000_000)
-        self.actor_spin.setValue(900)
-        self.actor_spin.setPrefix("Actor ")
-        lower.addWidget(self.actor_spin)
-        self.qlabs_button = QPushButton("Connect Replay")
-        self.qlabs_button.clicked.connect(self.toggle_qlabs)
-        lower.addWidget(self.qlabs_button)
-        self.trailing_button = QPushButton("Trailing")
-        self.trailing_button.clicked.connect(self.possess_trailing)
-        lower.addWidget(self.trailing_button)
-        self.overhead_button = QPushButton("Overhead")
-        self.overhead_button.clicked.connect(self.possess_overhead)
-        lower.addWidget(self.overhead_button)
-        self.front_button = QPushButton("Front")
-        self.front_button.clicked.connect(self.possess_front)
-        lower.addWidget(self.front_button)
+        lower.addWidget(QLabel("Replay outputs: Map + Video"))
 
         video_row = QHBoxLayout()
         outer.addLayout(video_row)
-        video_row.addWidget(QLabel("Video (optional):"))
+        video_row.addWidget(QLabel("Video window:"))
         self.video_path_edit = QLineEdit()
         self.video_path_edit.setReadOnly(True)
         video_row.addWidget(self.video_path_edit, 1)
-        self.load_video_button = QPushButton("Load Video…")
+        self.load_video_button = QPushButton("Load Manual Video…")
         self.load_video_button.clicked.connect(self.choose_video)
         video_row.addWidget(self.load_video_button)
         self.show_video_button = QPushButton("Show Video Window")
@@ -449,17 +425,21 @@ class ReplayWindow(QMainWindow):
         )
         self.status_label.setText(f"Loaded session: {session.folder}")
 
-        # Optional future-compatible video entry in session.json.
-        video_meta = session.metadata.get("video")
-        if isinstance(video_meta, dict) and video_meta.get("file"):
-            candidate = session.folder / str(video_meta["file"])
-            if candidate.is_file():
-                try:
-                    self.video_sink.load_video(candidate)
-                    self.video_path_edit.setText(str(candidate))
-                    self.video_offset_spin.setValue(float(video_meta.get("offset_s", 0.0)))
-                except Exception:
-                    pass
+        # VideoReplaySink auto-discovers all synchronized session videos.
+        if self.video_window.available_source_count() > 0:
+            self.video_window.show()
+            self.video_window.raise_()
+            if self.video_window.video_path is not None:
+                self.video_path_edit.setText(str(self.video_window.video_path))
+            self.status_label.setText(
+                f"Loaded session: {session.folder} — "
+                f"{self.video_window.available_source_count()} video source(s) available."
+            )
+        else:
+            self.video_path_edit.clear()
+            self.status_label.setText(
+                f"Loaded session: {session.folder} — no recorded video file was found."
+            )
 
     def on_duration_changed(self, duration_s: float) -> None:
         self.timeline.setRange(0, max(0, int(round(duration_s * 1000.0))))
@@ -541,50 +521,6 @@ class ReplayWindow(QMainWindow):
             f"X={candidate.x:.2f}, Y={candidate.y:.2f}, Z={candidate.z:.2f}."
         )
 
-    def toggle_qlabs(self) -> None:
-        if self.qlabs_sink.connected:
-            self.qlabs_sink.disconnect(destroy_spawned=True)
-            self.qlabs_button.setText("Connect Replay")
-            self.status_label.setText("QLabs replay disconnected.")
-            return
-
-        pose = self.coordinator.current_pose()
-        if pose is None:
-            QMessageBox.information(self, "Load session", "Load a recorded session first.")
-            return
-        try:
-            mode = self.qlabs_sink.connect(
-                host=self.host_edit.text().strip() or "localhost",
-                actor_number=self.actor_spin.value(),
-                initial_location=[pose.x, pose.y, pose.z],
-                initial_yaw_rad=pose.yaw_rad,
-            )
-            self.coordinator.sync_now()
-        except Exception as exc:
-            QMessageBox.critical(self, "QLabs replay connection failed", str(exc))
-            return
-        self.qlabs_button.setText("Disconnect Replay")
-        self.status_label.setText(
-            f"QLabs replay connected; actor {self.actor_spin.value()} was {mode}. "
-            "Open Road should already be loaded in QLabs."
-        )
-
-    def possess_trailing(self) -> None:
-        self._possess(self.qlabs_sink.possess_trailing, "trailing")
-
-    def possess_overhead(self) -> None:
-        self._possess(self.qlabs_sink.possess_overhead, "overhead")
-
-    def possess_front(self) -> None:
-        self._possess(self.qlabs_sink.possess_front, "front")
-
-    def _possess(self, fn, label: str) -> None:
-        try:
-            fn()
-            self.status_label.setText(f"QLabs replay camera: {label}.")
-        except Exception as exc:
-            QMessageBox.warning(self, "QLabs camera", str(exc))
-
     def choose_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -664,6 +600,8 @@ def main() -> int:
     if args.session is not None:
         window.load_session(args.session)
     window.show()
+    # The reviewer intentionally uses two windows: map/timeline and video.
+    window.video_window.show()
     return app.exec()
 
 
