@@ -2,15 +2,16 @@
   "format": "qlabs_drive_session",
   "version": 2,
   "workspace": "Open Road",
-  "session_id": "2026-09-10_090638",
-  "status": "error",
-  "created_utc": "2026-09-10T06:06:38.920707+00:00",
-  "recording_started_utc": null,
-  "finished_utc": "2026-09-10T06:06:44.502591+00:00",
+  "session_id": "2026-09-10_113437_test_run_02_lower_lane_right_most",
+  "status": "complete",
+  "created_utc": "2026-09-10T08:34:37.508149+00:00",
+  "recording_started_utc": "2026-09-10T08:34:38.148282+00:00",
+  "finished_utc": "2026-09-10T08:34:39.434287+00:00",
   "timebase": {
     "kind": "obs_aligned_monotonic_seconds",
     "column": "time_s",
-    "description": "Seconds from the estimated first OBS-recorded video frame. Telemetry may begin slightly after t=0 while startup completes."
+    "description": "Seconds from the estimated first OBS-recorded video frame. Telemetry may begin slightly after t=0 while startup completes.",
+    "obs_duration_at_first_status_s": 0.0
   },
   "source": {
     "kind": "qlabs_qcar2_world_transform",
@@ -31,15 +32,15 @@
       "valid"
     ],
     "requested_sample_rate_hz": 20.0,
-    "sample_count": 0,
+    "sample_count": 26,
     "dropped_samples": 0,
-    "duration_s": 0.0
+    "duration_s": 1.286358
   },
   "videos": {
     "qlabs_front": {
       "kind": "obs_qlabs_window",
       "label": "QLabs Front (OBS)",
-      "path": null,
+      "path": "C:/Users/quanser/Videos/2026-09-10 11-34-38.mp4",
       "sync_file": "obs_sync.csv",
       "preferred": true
     }
@@ -61,7 +62,7 @@
     "host": "localhost",
     "port": 4455,
     "sync_file": "obs_sync.csv",
-    "recording_path": null
-  },
-  "error": "QLabs rejected connection to 'localhost'."
+    "recording_path": "C:/Users/quanser/Videos/2026-09-10 11-34-38.mp4",
+    "sync_samples": 2
+  }
 }
