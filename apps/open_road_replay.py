@@ -35,12 +35,14 @@ from PySide6.QtWidgets import (
 )
 
 from core.replay_core import (
+    OpenRoadLaneGeometry,
     PassCandidate,
     SessionData,
     extract_stable_completed_loop,
     find_open_road_reference,
     format_time_s,
     load_open_road_reference,
+    load_open_road_six_lane_geometry,
     offset_polyline_xy,
     rdp_simplify,
 )
@@ -49,16 +51,36 @@ from core.replay_controller import ReplayCoordinator
 from integrations.replay_sinks import MapReplaySink, VideoReplaySink
 from ui.replay_video_window import VideoWindow
 
+# Legacy single-reference fallback. New installations use the six measured
+# lane-center JSONs and the calibrated +/-12 m road boundaries.
 LANE_WIDTH_M = 4.0
 MEDIAN_WIDTH_M = 0.25
 LOGGED_LANE_OFFSET_FROM_MEDIAN_M = MEDIAN_WIDTH_M / 2.0 + 1.5 * LANE_WIDTH_M
 TOTAL_APPROX_ROAD_WIDTH_M = 6.0 * LANE_WIDTH_M + MEDIAN_WIDTH_M
 
+# Distinct trajectory colors for multi-record comparison. Colors are assigned
+# in load order and remain attached to each recording when the active replay changes.
+SESSION_COLORS = [
+    (52, 183, 245),
+    (255, 156, 64),
+    (225, 91, 154),
+    (79, 210, 170),
+    (173, 126, 255),
+    (245, 205, 70),
+    (239, 92, 92),
+    (83, 203, 232),
+]
+
 
 class ReplayMap(QWidget):
     mapClicked = Signal(float, float)
 
-    def __init__(self, reference_loop: list[list[float]], parent=None) -> None:
+    def __init__(
+        self,
+        reference_loop: list[list[float]],
+        lane_geometry: OpenRoadLaneGeometry | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setMinimumSize(900, 500)
         self.setMouseTracking(True)
@@ -66,14 +88,23 @@ class ReplayMap(QWidget):
 
         self.reference_loop = reference_loop
         self.reference_display = rdp_simplify(reference_loop, tolerance_m=3.0)
+        self.lane_geometry = lane_geometry
+
+        # Legacy fallback for repositories that only have one Open Road trace.
         self.median_points = offset_polyline_xy(
             self.reference_display,
             LOGGED_LANE_OFFSET_FROM_MEDIAN_M,
             closed=True,
         )
 
-        xs = [p[0] for p in reference_loop]
-        ys = [p[1] for p in reference_loop]
+        if lane_geometry is not None:
+            bound_paths = lane_geometry.all_xy_paths()
+            xs = [float(p[0]) for path in bound_paths for p in path]
+            ys = [float(p[1]) for path in bound_paths for p in path]
+        else:
+            xs = [float(p[0]) for p in reference_loop]
+            ys = [float(p[1]) for p in reference_loop]
+
         self.data_min_x = min(xs)
         self.data_max_x = max(xs)
         self.data_min_y = min(ys)
@@ -85,9 +116,15 @@ class ReplayMap(QWidget):
         self.center_y = self.data_center_y
         self.zoom = 1.0
 
+        # One recording is active for video/timeline replay, while any number of
+        # additional recordings can remain visible for trajectory comparison.
         self.session: SessionData | None = None
         self.session_display: list[list[float]] = []
         self.current_pose = None
+        self.session_overlays: dict[str, dict] = {}
+        self.active_session_key: str | None = None
+        self.comparison_poses: dict[str, object] = {}
+        self._display_cache: dict[str, list[list[float]]] = {}
         self.hover_world: tuple[float, float] | None = None
         self.last_clicked_world: tuple[float, float] | None = None
 
@@ -95,11 +132,55 @@ class ReplayMap(QWidget):
         self._pan_last = QPointF()
 
     def set_session(self, session: SessionData | None) -> None:
+        """Set the active replay without clearing comparison trajectories."""
         self.session = session
         if session is None:
             self.session_display = []
+        elif self.session_overlays:
+            # Multi-record mode already owns cached simplified trajectories.
+            self.session_display = []
         else:
-            self.session_display = rdp_simplify(session.xyz_points(), tolerance_m=2.0)
+            self.session_display = rdp_simplify(session.xyz_points(), tolerance_m=1.0)
+        self.update()
+
+    def set_session_overlays(self, entries: list[dict], active_key: str | None) -> None:
+        keep_keys = {str(entry["key"]) for entry in entries}
+        self._display_cache = {
+            key: value for key, value in self._display_cache.items() if key in keep_keys
+        }
+        overlays: dict[str, dict] = {}
+        for entry in entries:
+            key = str(entry["key"])
+            session = entry["session"]
+            if key not in self._display_cache:
+                self._display_cache[key] = rdp_simplify(
+                    session.xyz_points(), tolerance_m=1.0
+                )
+            overlays[key] = {
+                "key": key,
+                "label": str(entry["label"]),
+                "session": session,
+                "color": tuple(entry["color"]),
+                "display": self._display_cache[key],
+            }
+        self.session_overlays = overlays
+        self.active_session_key = active_key
+        self.comparison_poses = {}
+        self.update()
+
+    def set_comparison_time(self, time_s: float) -> None:
+        """Place all comparison cars at the same elapsed session time."""
+        poses: dict[str, object] = {}
+        for key, entry in self.session_overlays.items():
+            if key == self.active_session_key:
+                continue
+            session = entry["session"]
+            if not session.times:
+                continue
+            if float(time_s) < float(session.times[0]) or float(time_s) > session.duration_s:
+                continue
+            poses[key] = session.pose_at(time_s)
+        self.comparison_poses = poses
         self.update()
 
     def set_current_pose(self, pose) -> None:
@@ -154,11 +235,65 @@ class ReplayMap(QWidget):
             path.lineTo(p)
         return path
 
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor(31, 35, 41))
+    def _draw_six_lane_reference(self, painter: QPainter) -> None:
+        geometry = self.lane_geometry
+        if geometry is None:
+            return
 
+        scale = self.pixels_per_metre()
+
+        # Two real three-lane carriageways, calibrated on the straight to
+        # approximately +0.6..+12 m and -12..-0.6 m. At whole-map zoom the
+        # pavement is kept visible with a small minimum pixel width.
+        carriageway_width_m = 11.4
+        surface_width_px = max(3.0, min(160.0, carriageway_width_m * scale))
+        surface_pen = QPen(QColor(75, 81, 90), surface_width_px)
+        surface_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        surface_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(surface_pen)
+        painter.drawPath(self._make_path(geometry.lane_centers["upper_middle"]))
+        painter.drawPath(self._make_path(geometry.lane_centers["lower_middle"]))
+
+        # Median/barrier: rounded straight calibration uses pavement edges at
+        # +/-0.6 m, so the visual barrier is about 1.2 m wide.
+        median_width_px = max(1.8, min(28.0, 1.2 * scale))
+        median_pen = QPen(QColor(164, 155, 128), median_width_px)
+        median_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        median_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(median_pen)
+        painter.drawPath(self._make_path(geometry.median_center))
+
+        # Solid road boundaries: +/-12 m outer edges and the two median-side
+        # pavement edges. Use cosmetic pens so boundaries remain legible when
+        # viewing the entire 50 km loop.
+        edge_pen = QPen(QColor(226, 230, 235), 1.35)
+        edge_pen.setCosmetic(True)
+        painter.setPen(edge_pen)
+        for path in geometry.outer_edges.values():
+            painter.drawPath(self._make_path(path))
+        for path in geometry.median_edges.values():
+            painter.drawPath(self._make_path(path))
+
+        # Painted dashed lane dividers. These are approximated halfway between
+        # adjacent measured lane-center trajectories, producing +/-8 and +/-4 m
+        # on the calibrated straight section.
+        divider_pen = QPen(QColor(215, 221, 228), 1.05)
+        divider_pen.setCosmetic(True)
+        divider_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(divider_pen)
+        for path in geometry.lane_dividers.values():
+            painter.drawPath(self._make_path(path))
+
+        # Faint lane-center guides show exactly where the six measured QCar
+        # reference runs are. They stay secondary to both markings and session.
+        center_pen = QPen(QColor(132, 158, 178, 135), 0.75)
+        center_pen.setCosmetic(True)
+        center_pen.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(center_pen)
+        for path in geometry.lane_centers.values():
+            painter.drawPath(self._make_path(path))
+
+    def _draw_legacy_reference(self, painter: QPainter) -> None:
         scale = self.pixels_per_metre()
         road_width_px = max(3.0, min(90.0, TOTAL_APPROX_ROAD_WIDTH_M * scale))
         road_pen = QPen(QColor(82, 88, 96), road_width_px)
@@ -167,7 +302,7 @@ class ReplayMap(QWidget):
         painter.setPen(road_pen)
         painter.drawPath(self._make_path(self.median_points))
 
-        median_pen = QPen(QColor(176, 163, 112), max(1.0, min(8.0, MEDIAN_WIDTH_M * scale)))
+        median_pen = QPen(QColor(176, 163, 112), 1.2)
         median_pen.setCosmetic(True)
         painter.setPen(median_pen)
         painter.drawPath(self._make_path(self.median_points))
@@ -178,34 +313,82 @@ class ReplayMap(QWidget):
         painter.setPen(reference_pen)
         painter.drawPath(self._make_path(self.reference_display))
 
-        if self.session_display:
-            session_pen = QPen(QColor(74, 176, 230), 2.2)
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(31, 35, 41))
+
+        if self.lane_geometry is not None:
+            self._draw_six_lane_reference(painter)
+        else:
+            self._draw_legacy_reference(painter)
+
+        # Every loaded recording gets a persistent color. The active recording
+        # is drawn last and thicker because it controls the video/timeline.
+        overlay_items = list(self.session_overlays.items())
+        overlay_items.sort(key=lambda item: item[0] == self.active_session_key)
+        for key, entry in overlay_items:
+            color = QColor(*entry["color"])
+            session_pen = QPen(color, 3.4 if key == self.active_session_key else 2.1)
+            session_pen.setCosmetic(True)
+            session_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            session_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(session_pen)
+            painter.drawPath(self._make_path(entry["display"]))
+
+        if not self.session_overlays and self.session_display:
+            session_pen = QPen(QColor(52, 183, 245), 3.0)
             session_pen.setCosmetic(True)
             painter.setPen(session_pen)
             painter.drawPath(self._make_path(self.session_display))
 
         origin = self.world_to_screen(0.0, 0.0)
-        axis_pen = QPen(QColor(90, 140, 180, 90), 1.0)
+        axis_pen = QPen(QColor(90, 140, 180, 75), 1.0)
         axis_pen.setCosmetic(True)
         painter.setPen(axis_pen)
         painter.drawLine(QPointF(origin.x(), 0), QPointF(origin.x(), self.height()))
         painter.drawLine(QPointF(0, origin.y()), QPointF(self.width(), origin.y()))
 
-        if self.current_pose is not None:
-            p = self.world_to_screen(self.current_pose.x, self.current_pose.y)
-            marker_pen = QPen(QColor(92, 236, 153), 2.0)
+        marker_poses = dict(self.comparison_poses)
+        if self.current_pose is not None and self.active_session_key is not None:
+            marker_poses[self.active_session_key] = self.current_pose
+
+        for marker_index, (key, pose) in enumerate(marker_poses.items()):
+            entry = self.session_overlays.get(key)
+            if entry is None:
+                continue
+            color = QColor(*entry["color"])
+            p = self.world_to_screen(pose.x, pose.y)
+            active = key == self.active_session_key
+            radius = 8.0 if active else 6.0
+
+            marker_pen = QPen(QColor(245, 248, 250), 2.0 if active else 1.2)
             marker_pen.setCosmetic(True)
             painter.setPen(marker_pen)
-            painter.setBrush(QColor(92, 236, 153, 100))
-            painter.drawEllipse(p, 7.0, 7.0)
+            fill = QColor(color)
+            fill.setAlpha(210)
+            painter.setBrush(fill)
+            painter.drawEllipse(p, radius, radius)
 
-            # Heading tick.
-            length_px = 20.0
+            heading_pen = QPen(color, 2.0 if active else 1.4)
+            heading_pen.setCosmetic(True)
+            painter.setPen(heading_pen)
+            length_px = 22.0 if active else 16.0
             end = QPointF(
-                p.x() + math.cos(self.current_pose.yaw_rad) * length_px,
-                p.y() - math.sin(self.current_pose.yaw_rad) * length_px,
+                p.x() + math.cos(pose.yaw_rad) * length_px,
+                p.y() - math.sin(pose.yaw_rad) * length_px,
             )
             painter.drawLine(p, end)
+
+            painter.setPen(QColor(235, 239, 243))
+            label = entry["label"]
+            if len(label) > 24:
+                label = label[:21] + "…"
+            prefix = "ACTIVE: " if active else ""
+            painter.drawText(
+                p + QPointF(9.0, -9.0 - (marker_index % 2) * 10.0),
+                prefix + label,
+            )
 
         if self.last_clicked_world is not None:
             p = self.world_to_screen(*self.last_clicked_world)
@@ -222,13 +405,46 @@ class ReplayMap(QWidget):
                 22,
                 f"Cursor X {self.hover_world[0]:.1f} m   Y {self.hover_world[1]:.1f} m",
             )
+
+        # Compact recording/color legend. This stays visible even when current
+        # car markers overlap on the same lane.
+        if self.session_overlays:
+            legend_x = max(12, self.width() - 300)
+            legend_y = 22
+            max_rows = 10
+            for row, (key, entry) in enumerate(list(self.session_overlays.items())[:max_rows]):
+                color = QColor(*entry["color"])
+                line_pen = QPen(color, 3.0 if key == self.active_session_key else 2.0)
+                line_pen.setCosmetic(True)
+                painter.setPen(line_pen)
+                painter.drawLine(legend_x, legend_y + row * 18 - 5, legend_x + 24, legend_y + row * 18 - 5)
+                painter.setPen(QColor(230, 234, 238))
+                label = entry["label"]
+                if len(label) > 26:
+                    label = label[:23] + "…"
+                prefix = "ACTIVE — " if key == self.active_session_key else ""
+                painter.drawText(legend_x + 31, legend_y + row * 18, prefix + label)
+            if len(self.session_overlays) > max_rows:
+                painter.setPen(QColor(184, 192, 201))
+                painter.drawText(
+                    legend_x + 31,
+                    legend_y + max_rows * 18,
+                    f"+{len(self.session_overlays) - max_rows} more",
+                )
+
         painter.setPen(QColor(184, 192, 201))
-        painter.drawText(
-            12,
-            self.height() - 12,
-            "Blue: recorded session   Yellow dotted: Open Road reference   |   "
-            "Left click route: seek   Wheel: zoom   Middle/right drag: pan",
-        )
+        if self.lane_geometry is not None:
+            legend = (
+                "White: road/lane markings   Faint dotted: six measured lane centers   "
+                "Colored: loaded recordings (thicker = active)   |   "
+                "Left click any route: seek/switch   Wheel: zoom   Middle/right drag: pan"
+            )
+        else:
+            legend = (
+                "Blue: recorded session   Yellow dotted: legacy Open Road reference   |   "
+                "Left click route: seek   Wheel: zoom   Middle/right drag: pan"
+            )
+        painter.drawText(12, self.height() - 12, legend)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         pos = event.position()
@@ -276,13 +492,23 @@ class ReplayWindow(QMainWindow):
     synchronization and broadcasts state to ReplaySink implementations.
     """
 
-    def __init__(self, reference_path: Path, reference_loop: list[list[float]]) -> None:
+    def __init__(
+        self,
+        reference_path: Path,
+        reference_loop: list[list[float]],
+        lane_geometry: OpenRoadLaneGeometry | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("QLabs Open Road Drive Replay — OOP")
         self.resize(1320, 820)
 
         self.reference_path = reference_path
         self.session: SessionData | None = None
+        self.loaded_sessions: dict[str, SessionData] = {}
+        self.session_labels: dict[str, str] = {}
+        self.session_colors: dict[str, tuple[int, int, int]] = {}
+        self.session_order: list[str] = []
+        self.active_session_key: str | None = None
         self.clock = ReplayClock(self)
         self.coordinator = ReplayCoordinator(self.clock, self)
         self._slider_dragging = False
@@ -295,18 +521,43 @@ class ReplayWindow(QMainWindow):
         top = QHBoxLayout()
         outer.addLayout(top)
 
-        self.load_button = QPushButton("Load Session…")
+        self.load_button = QPushButton("Add Session…")
+        self.load_button.setToolTip("Add one recorded session to the comparison map.")
         self.load_button.clicked.connect(self.choose_session)
         top.addWidget(self.load_button)
 
-        self.session_label = QLabel("No recording loaded")
+        self.load_folder_button = QPushButton("Add Recordings Folder…")
+        self.load_folder_button.setToolTip(
+            "Load every session.json found below a recordings folder."
+        )
+        self.load_folder_button.clicked.connect(self.choose_recordings_folder)
+        top.addWidget(self.load_folder_button)
+
+        top.addWidget(QLabel("Active replay:"))
+        self.active_session_combo = QComboBox()
+        self.active_session_combo.setMinimumWidth(220)
+        self.active_session_combo.setToolTip(
+            "The active recording controls the timeline and video; all loaded trajectories stay visible."
+        )
+        self.active_session_combo.currentIndexChanged.connect(self.on_active_session_changed)
+        top.addWidget(self.active_session_combo)
+
+        self.remove_session_button = QPushButton("Remove Active")
+        self.remove_session_button.clicked.connect(self.remove_active_session)
+        top.addWidget(self.remove_session_button)
+
+        self.clear_sessions_button = QPushButton("Clear All")
+        self.clear_sessions_button.clicked.connect(self.clear_sessions)
+        top.addWidget(self.clear_sessions_button)
+
+        self.session_label = QLabel("0 recordings loaded")
         self.session_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         top.addWidget(self.session_label, 1)
 
         self.reset_map_button = QPushButton("Reset Map")
         top.addWidget(self.reset_map_button)
 
-        self.map_widget = ReplayMap(reference_loop)
+        self.map_widget = ReplayMap(reference_loop, lane_geometry=lane_geometry)
         self.map_widget.mapClicked.connect(self.on_map_clicked)
         self.reset_map_button.clicked.connect(self.map_widget.reset_view)
         outer.addWidget(self.map_widget, 1)
@@ -394,8 +645,10 @@ class ReplayWindow(QMainWindow):
         self.video_offset_spin.valueChanged.connect(self.video_sink.set_offset_s)
         video_row.addWidget(self.video_offset_spin)
 
+        reference_mode = "six measured lane references" if lane_geometry is not None else "legacy single reference"
         self.status_label = QLabel(
-            f"Open Road reference: {reference_path}. Load a recorded session to begin."
+            f"Open Road reference: {reference_path} ({reference_mode}). "
+            "Load a recorded session to begin."
         )
         self.status_label.setWordWrap(True)
         outer.addWidget(self.status_label)
@@ -408,38 +661,214 @@ class ReplayWindow(QMainWindow):
     def choose_session(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose recorded session folder")
         if path:
-            self.load_session(Path(path))
+            self.add_session(Path(path), make_active=True)
 
-    def load_session(self, path: Path) -> None:
+    def choose_recordings_folder(self) -> None:
+        root = QFileDialog.getExistingDirectory(
+            self, "Choose folder containing recorded sessions"
+        )
+        if not root:
+            return
+        root_path = Path(root)
+        candidates = sorted({path.parent for path in root_path.rglob("session.json")})
+        if not candidates:
+            QMessageBox.information(
+                self, "No sessions found",
+                f"No session.json files were found below:\n{root_path}",
+            )
+            return
+
+        loaded = 0
+        first_new_key: str | None = None
+        for folder in candidates:
+            key = str(folder.resolve())
+            if key in self.loaded_sessions:
+                continue
+            if self.add_session(folder, make_active=False, show_errors=False):
+                loaded += 1
+                if first_new_key is None:
+                    first_new_key = key
+
+        if self.active_session_key is None and first_new_key is not None:
+            self.set_active_session(first_new_key, preserve_time=False)
+        else:
+            self._refresh_session_ui()
+        self.status_label.setText(
+            f"Loaded {loaded} new recording(s) from {root_path}. "
+            f"{len(self.loaded_sessions)} total trajectories visible."
+        )
+
+    def _unique_session_label(self, session: SessionData) -> str:
+        base = session.folder.name or "recording"
+        used = set(self.session_labels.values())
+        if base not in used:
+            return base
+        counter = 2
+        while f"{base} ({counter})" in used:
+            counter += 1
+        return f"{base} ({counter})"
+
+    def _session_overlay_entries(self) -> list[dict]:
+        entries: list[dict] = []
+        for key in self.session_order:
+            session = self.loaded_sessions.get(key)
+            if session is None:
+                continue
+            entries.append({
+                "key": key,
+                "label": self.session_labels[key],
+                "session": session,
+                "color": self.session_colors[key],
+            })
+        return entries
+
+    def _refresh_session_ui(self) -> None:
+        self.active_session_combo.blockSignals(True)
+        self.active_session_combo.clear()
+        active_index = -1
+        for key in self.session_order:
+            if key not in self.loaded_sessions:
+                continue
+            label = self.session_labels[key]
+            color = self.session_colors[key]
+            self.active_session_combo.addItem(label, key)
+            item_index = self.active_session_combo.count() - 1
+            self.active_session_combo.setItemData(
+                item_index, QColor(*color), Qt.ItemDataRole.ForegroundRole
+            )
+            if key == self.active_session_key:
+                active_index = item_index
+        if active_index >= 0:
+            self.active_session_combo.setCurrentIndex(active_index)
+        self.active_session_combo.blockSignals(False)
+
+        self.map_widget.set_session_overlays(
+            self._session_overlay_entries(), self.active_session_key
+        )
+        self.map_widget.set_comparison_time(self.clock.current_time_s)
+
+        count = len(self.loaded_sessions)
+        if self.active_session_key in self.loaded_sessions:
+            active = self.loaded_sessions[self.active_session_key]
+            label = self.session_labels[self.active_session_key]
+            self.session_label.setText(
+                f"{count} recording(s) loaded — active: {label} — "
+                f"{active.sample_count:,} samples — {format_time_s(active.duration_s)}"
+            )
+        else:
+            self.session_label.setText(f"{count} recording(s) loaded")
+        self.remove_session_button.setEnabled(count > 0)
+        self.clear_sessions_button.setEnabled(count > 0)
+        self.active_session_combo.setEnabled(count > 0)
+
+    def add_session(
+        self, path: Path, make_active: bool = True, show_errors: bool = True
+    ) -> bool:
         try:
             session = SessionData.load(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Could not load session", str(exc))
+            if show_errors:
+                QMessageBox.critical(self, "Could not load session", str(exc))
+            return False
+
+        key = str(session.folder.resolve())
+        if key not in self.loaded_sessions:
+            self.loaded_sessions[key] = session
+            self.session_order.append(key)
+            self.session_labels[key] = self._unique_session_label(session)
+            used_colors = set(self.session_colors.values())
+            available = [color for color in SESSION_COLORS if color not in used_colors]
+            if available:
+                self.session_colors[key] = available[0]
+            else:
+                palette_index = (len(self.session_order) - 1) % len(SESSION_COLORS)
+                self.session_colors[key] = SESSION_COLORS[palette_index]
+
+        if make_active or self.active_session_key is None:
+            self.set_active_session(
+                key, preserve_time=(self.active_session_key is not None)
+            )
+        else:
+            self._refresh_session_ui()
+        return True
+
+    def load_session(self, path: Path) -> None:
+        """Backward-compatible API: loading now adds rather than replaces."""
+        self.add_session(path, make_active=True)
+
+    def set_active_session(self, key: str, preserve_time: bool = True) -> None:
+        if key not in self.loaded_sessions:
             return
+        old_time = self.clock.current_time_s if preserve_time else 0.0
+        self.active_session_key = key
+        self.session = self.loaded_sessions[key]
+        # Populate/cached map overlays before the coordinator changes the active
+        # sink session, avoiding a second simplification of long telemetry.
+        self._refresh_session_ui()
+        self.coordinator.set_session(self.session)
+        self.clock.seek(min(old_time, self.session.duration_s) if preserve_time else 0.0)
 
-        self.session = session
-        self.coordinator.set_session(session)
-        self.session_label.setText(
-            f"{session.folder.name} — {session.sample_count:,} samples — "
-            f"{format_time_s(session.duration_s)}"
-        )
-        self.status_label.setText(f"Loaded session: {session.folder}")
-
-        # VideoReplaySink auto-discovers all synchronized session videos.
+        label = self.session_labels[key]
         if self.video_window.available_source_count() > 0:
             self.video_window.show()
             self.video_window.raise_()
             if self.video_window.video_path is not None:
                 self.video_path_edit.setText(str(self.video_window.video_path))
             self.status_label.setText(
-                f"Loaded session: {session.folder} — "
+                f"Active replay: {label}. {len(self.loaded_sessions)} trajectories visible; "
                 f"{self.video_window.available_source_count()} video source(s) available."
             )
         else:
             self.video_path_edit.clear()
             self.status_label.setText(
-                f"Loaded session: {session.folder} — no recorded video file was found."
+                f"Active replay: {label}. {len(self.loaded_sessions)} trajectories visible; "
+                "no recorded video file was found for the active session."
             )
+
+    def on_active_session_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        key = self.active_session_combo.itemData(index)
+        if key and str(key) != self.active_session_key:
+            self.set_active_session(str(key), preserve_time=True)
+
+    def remove_active_session(self) -> None:
+        key = self.active_session_key
+        if key is None or key not in self.loaded_sessions:
+            return
+        self.clock.pause()
+        try:
+            index = self.session_order.index(key)
+        except ValueError:
+            index = 0
+        self.loaded_sessions.pop(key, None)
+        self.session_labels.pop(key, None)
+        self.session_colors.pop(key, None)
+        self.session_order = [item for item in self.session_order if item != key]
+
+        if self.session_order:
+            next_index = min(index, len(self.session_order) - 1)
+            self.set_active_session(self.session_order[next_index], preserve_time=False)
+        else:
+            self.active_session_key = None
+            self.session = None
+            self.coordinator.set_session(None)
+            self.video_path_edit.clear()
+            self._refresh_session_ui()
+            self.status_label.setText("All recordings removed. Add a session to begin.")
+
+    def clear_sessions(self) -> None:
+        self.clock.pause()
+        self.loaded_sessions.clear()
+        self.session_labels.clear()
+        self.session_colors.clear()
+        self.session_order.clear()
+        self.active_session_key = None
+        self.session = None
+        self.coordinator.set_session(None)
+        self.video_path_edit.clear()
+        self._refresh_session_ui()
+        self.status_label.setText("All recordings cleared.")
 
     def on_duration_changed(self, duration_s: float) -> None:
         self.timeline.setRange(0, max(0, int(round(duration_s * 1000.0))))
@@ -456,6 +885,7 @@ class ReplayWindow(QMainWindow):
         self.time_label.setText(
             f"{format_time_s(time_s)} / {format_time_s(self.session.duration_s)}"
         )
+        self.map_widget.set_comparison_time(time_s)
         if not self._slider_dragging:
             self.timeline.blockSignals(True)
             self.timeline.setValue(int(round(time_s * 1000.0)))
@@ -481,43 +911,68 @@ class ReplayWindow(QMainWindow):
         self._resume_after_drag = False
 
     def on_map_clicked(self, x: float, y: float) -> None:
-        if self.session is None:
-            self.status_label.setText("Load a recording before seeking from the map.")
+        if not self.loaded_sessions:
+            self.status_label.setText(
+                "Load one or more recordings before seeking from the map."
+            )
             return
 
         radius = self.map_widget.click_radius_m()
-        candidates = self.session.find_passes(x, y, radius_m=radius)
-        if not candidates:
-            nearest = self.session.nearest_sample(x, y)
+        matches: list[tuple[str, PassCandidate]] = []
+        nearest: tuple[str, PassCandidate] | None = None
+        for key in self.session_order:
+            session = self.loaded_sessions[key]
+            for candidate in session.find_passes(x, y, radius_m=radius):
+                matches.append((key, candidate))
+            candidate = session.nearest_sample(x, y)
+            if nearest is None or candidate.distance_m < nearest[1].distance_m:
+                nearest = (key, candidate)
+
+        if not matches:
+            assert nearest is not None
+            key, candidate = nearest
             self.status_label.setText(
-                f"No recorded pass within {radius:.1f} m. Nearest route point is "
-                f"{nearest.distance_m:.1f} m away at {format_time_s(nearest.time_s)}."
+                f"No loaded recording passes within {radius:.1f} m. Nearest is "
+                f"{self.session_labels[key]}: {candidate.distance_m:.1f} m away at "
+                f"{format_time_s(candidate.time_s)}."
             )
             return
 
-        if len(candidates) == 1:
-            self.seek_candidate(candidates[0])
+        if len(matches) == 1:
+            self.seek_candidate(matches[0][0], matches[0][1])
             return
 
         menu = QMenu(self)
-        title = menu.addAction(f"{len(candidates)} passes found — choose one")
+        title = menu.addAction(
+            f"{len(matches)} pass(es) found across loaded recordings"
+        )
         title.setEnabled(False)
         menu.addSeparator()
-        for number, candidate in enumerate(candidates, start=1):
-            action = menu.addAction(
-                f"Pass {number}: {format_time_s(candidate.time_s)}   "
-                f"({candidate.distance_m:.1f} m from click)"
-            )
-            action.triggered.connect(
-                lambda _checked=False, c=candidate: self.seek_candidate(c)
-            )
+        for key in self.session_order:
+            session_matches = [c for k, c in matches if k == key]
+            if not session_matches:
+                continue
+            header = menu.addAction(self.session_labels[key])
+            header.setEnabled(False)
+            for number, candidate in enumerate(session_matches, start=1):
+                action = menu.addAction(
+                    f"    Pass {number}: {format_time_s(candidate.time_s)}   "
+                    f"({candidate.distance_m:.1f} m from click)"
+                )
+                action.triggered.connect(
+                    lambda _checked=False, k=key, c=candidate: self.seek_candidate(k, c)
+                )
+            menu.addSeparator()
         menu.exec(QCursor.pos())
 
-    def seek_candidate(self, candidate: PassCandidate) -> None:
+    def seek_candidate(self, key: str, candidate: PassCandidate) -> None:
+        if key != self.active_session_key:
+            self.set_active_session(key, preserve_time=False)
         self.coordinator.force_sync()
         self.clock.seek(candidate.time_s)
         self.status_label.setText(
-            f"Jumped to {format_time_s(candidate.time_s)} — recorded point "
+            f"Active: {self.session_labels.get(key, key)} — jumped to "
+            f"{format_time_s(candidate.time_s)} — recorded point "
             f"X={candidate.x:.2f}, Y={candidate.y:.2f}, Z={candidate.z:.2f}."
         )
 
@@ -573,8 +1028,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--session",
         type=Path,
-        default=None,
-        help="Recorded session folder",
+        action="append",
+        default=[],
+        help="Recorded session folder. Repeat --session to overlay multiple recordings.",
     )
     parser.add_argument(
         "--reference",
@@ -591,14 +1047,15 @@ def main() -> int:
         reference_path = find_open_road_reference(args.reference, Path(__file__))
         _document, raw_reference = load_open_road_reference(reference_path)
         reference_loop, _info = extract_stable_completed_loop(raw_reference)
+        lane_geometry = load_open_road_six_lane_geometry(reference_path)
     except Exception as exc:
         print(f"Could not load Open Road reference: {exc}", file=sys.stderr)
         return 1
 
     app = QApplication(sys.argv)
-    window = ReplayWindow(reference_path, reference_loop)
-    if args.session is not None:
-        window.load_session(args.session)
+    window = ReplayWindow(reference_path, reference_loop, lane_geometry=lane_geometry)
+    for index, session_path in enumerate(args.session):
+        window.add_session(session_path, make_active=(index == 0))
     window.show()
     # The reviewer intentionally uses two windows: map/timeline and video.
     window.video_window.show()

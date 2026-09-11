@@ -9,7 +9,7 @@ from integrations.location_sources import QLabsQCarLocationSource
 from core.oop_interfaces import LocationReading, LocationSource, ReplaySink
 from integrations.qlabs_replay import QLabsReplaySink
 from core.recorder_core import RecorderWorker
-from core.replay_core import SessionData
+from core.replay_core import SessionData, build_open_road_lane_geometry
 from integrations.replay_sinks import MapReplaySink, VideoReplaySink
 
 
@@ -102,6 +102,32 @@ class OOPArchitectureTests(unittest.TestCase):
             )
             session = SessionData.load(session_dir)
             self.assertAlmostEqual(session.yaws[-1], 0.0, places=6)
+
+    def test_six_lane_geometry_uses_rounded_straight_markings(self) -> None:
+        # Synthetic parallel closed paths verify the calibrated straight values.
+        def lane(y: float) -> list[list[float]]:
+            return [[0.0, y, 1.0], [100.0, y, 1.0], [100.0, y + 20.0, 1.0], [0.0, y + 20.0, 1.0], [0.0, y, 1.0]]
+
+        geometry = build_open_road_lane_geometry(
+            {
+                "upper_right": lane(10.0),
+                "upper_middle": lane(6.0),
+                "upper_left": lane(2.0),
+                "lower_right": lane(-2.0),
+                "lower_middle": lane(-6.0),
+                "lower_left": lane(-10.0),
+            },
+            sample_count=32,
+        )
+        self.assertAlmostEqual(geometry.outer_edges["upper"][0][1], 12.0, places=6)
+        self.assertAlmostEqual(geometry.outer_edges["lower"][0][1], -12.0, places=6)
+        self.assertAlmostEqual(geometry.lane_dividers["upper_right_middle"][0][1], 8.0, places=6)
+        self.assertAlmostEqual(geometry.lane_dividers["upper_middle_left"][0][1], 4.0, places=6)
+        self.assertAlmostEqual(geometry.lane_dividers["lower_right_middle"][0][1], -4.0, places=6)
+        self.assertAlmostEqual(geometry.lane_dividers["lower_middle_left"][0][1], -8.0, places=6)
+        self.assertAlmostEqual(geometry.median_edges["upper"][0][1], 0.6, places=6)
+        self.assertAlmostEqual(geometry.median_edges["lower"][0][1], -0.6, places=6)
+
 
 
 if __name__ == "__main__":

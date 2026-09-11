@@ -498,11 +498,16 @@ There is intentionally **no QLabs replay window or QLabs replay button in the cu
 
 ---
 
-## 13. Load a session
+## 13. Load one or multiple sessions
 
-In the map/timeline window:
+The reviewer now supports **multiple recorded drives on the map at the same time**.
+One recording is the **active replay**: its video and duration control the master
+timeline. Every other loaded recording stays visible as a comparison trajectory,
+and its QCar marker is placed at the same elapsed session time.
 
-1. Click **Load Session...**.
+### Add one session
+
+1. Click **Add Session...**.
 2. Select the recording's **session folder**.
 
 Example:
@@ -511,35 +516,101 @@ Example:
 recordings\2026-09-10_091530_participant_001_run_01
 ```
 
-Select the folder itself — not `location.csv`.
+Select the folder itself — not `location.csv`. The program reads `session.json`
+and `location.csv` automatically.
 
-The program reads `session.json` and `location.csv` automatically.
+Repeat **Add Session...** for additional participants/runs. Each trajectory gets
+a different persistent color. The most recently added session becomes the active
+replay by default.
 
-If the OBS and camera video paths are available, the separate Video window automatically loads the synchronized video sources.
+### Add an entire recordings folder
+
+If many session folders are stored under the same parent directory, click
+**Add Recordings Folder...** and select that parent directory. The reviewer
+searches below it for `session.json` files and loads every valid recording that
+is not already open.
+
+### Choose the active replay
+
+Use the **Active replay** drop-down at the top of the map window. Changing the
+active recording:
+
+- keeps every loaded trajectory visible;
+- switches the Video window to that recording's available video sources;
+- changes the timeline duration to that recording;
+- preserves the current elapsed time when possible.
+
+Use **Remove Active** to remove only the selected recording, or **Clear All** to
+remove every comparison recording.
+
+The comparison clock is **session-relative**. For example, at replay time
+`00:05:00`, every loaded car with telemetry at five minutes is shown at its own
+five-minute position. A shorter recording simply stops showing a current-position
+marker after its duration; its complete trajectory remains visible.
+
+If the active session's OBS and camera video paths are available, the separate
+Video window automatically loads its synchronized video sources.
 
 ---
 
 ## 14. Map window controls
 
-The map uses the measured Open Road reference from:
+The map uses the six measured Open Road lane-center files when they are available:
 
 ```text
-data\open_road_reference.json
+data\open_road_reference_upper_right_lane.json
+data\open_road_reference_upper_middle_lane.json
+data\open_road_reference_upper_left_lane.json
+data\open_road_reference_lower_right_lane.json
+data\open_road_reference_lower_middle_lane.json
+data\open_road_reference_lower_left_lane.json
 ```
+
+`data\open_road_reference.json` is retained as the legacy/fallback reference.
+
+On the straight section, the reviewer uses the rounded road calibration:
+
+```text
++12 m   upper outer road edge
++10 m   upper-right lane center
+ +8 m   upper lane divider
+ +6 m   upper-middle lane center
+ +4 m   upper lane divider
+ +2 m   upper-left lane center
++0.6 m  upper median-side pavement edge
+-0.6 m  lower median-side pavement edge
+ -2 m   lower-right lane center
+ -4 m   lower lane divider
+ -6 m   lower-middle lane center
+ -8 m   lower lane divider
+-10 m   lower-left lane center
+-12 m   lower outer road edge
+```
+
+The six JSON recordings are treated as the authoritative lane centers. On curved
+sections the painted lane dividers and boundaries are approximated smoothly from
+those measured trajectories.
 
 Map colors are:
 
 ```text
-Blue line       = this recorded experiment's QCar trajectory
-Yellow dotted  = measured Open Road reference trajectory
-Green marker   = QCar position at the current replay time
+White/gray solid  = outer and median-side road boundaries
+White/gray dashed = lane dividers
+Faint dotted      = six measured lane-center references
+Colored lines     = loaded recorded QCar trajectories
+Thicker color     = active replay trajectory
+Colored markers   = each QCar position at the shared elapsed replay time
 ```
+
+Each loaded session keeps a distinct color. The active trajectory is thicker,
+and current car markers are labeled so overlapping participants/runs can still
+be distinguished.
 
 Controls:
 
 | Action | Result |
 |---|---|
-| Left-click recorded route | Jump to the time when the QCar passed that point |
+| Left-click any recorded route | Choose the recording/pass, make it active if needed, and jump to that time |
 | Mouse wheel | Zoom |
 | Middle/right-button drag | Pan |
 | Timeline drag | Seek replay time |
@@ -560,16 +631,21 @@ Playback rates available in the map/timeline window are:
 
 ### Locations visited more than once
 
-If the QCar passed a clicked location multiple times, for example on multiple laps, the reviewer does not automatically guess which visit you want.
-
-A menu appears showing separate pass times such as:
+If one or more loaded QCars passed a clicked location multiple times, the
+reviewer does not guess. A menu groups candidates by recording and lists each
+pass time, for example:
 
 ```text
-Pass 1: 00:31:14.550
-Pass 2: 01:20:47.300
+participant_001
+    Pass 1: 00:31:14.550
+    Pass 2: 01:20:47.300
+
+participant_002
+    Pass 1: 00:30:58.100
 ```
 
-Choose the desired pass and both the map and video seek to that experiment time.
+Choosing a candidate automatically makes that recording active, switches the
+Video window to it, and seeks both windows to that pass.
 
 ---
 
@@ -772,13 +848,15 @@ If a video file cannot be played, use a common OBS recording codec/container tha
 
 ## 27. Open Road map reference cannot be loaded
 
-Make sure this file still exists:
+Make sure the `data` folder contains the six lane-reference files listed in
+Section 14. If any of those files are missing, the reviewer falls back to:
 
 ```text
 data\open_road_reference.json
 ```
 
-The replay map uses this measured Open Road reference as the background road trajectory.
+The fallback keeps old copies of the repository usable, but it only shows the
+legacy single-reference road visualization rather than the full six-lane map.
 
 ---
 
@@ -854,7 +932,13 @@ QLabs_Drive_Replay/
 ├── ui/
 │   └── replay_video_window.py      # separate synchronized video window
 ├── data/
-│   └── open_road_reference.json
+│   ├── open_road_reference.json
+│   ├── open_road_reference_upper_right_lane.json
+│   ├── open_road_reference_upper_middle_lane.json
+│   ├── open_road_reference_upper_left_lane.json
+│   ├── open_road_reference_lower_right_lane.json
+│   ├── open_road_reference_lower_middle_lane.json
+│   └── open_road_reference_lower_left_lane.json
 ├── recordings/
 ├── run_recorder.py
 ├── run_replay.py

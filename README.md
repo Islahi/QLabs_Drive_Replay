@@ -56,9 +56,25 @@ available sources such as:
 - Right CSI
 - Rear CSI
 
-Switching camera keeps the same experiment time. Clicking a recorded location on
-the map seeks to the corresponding time; multiple visits to the same location
-are presented as separate pass candidates.
+Switching camera keeps the same experiment time. The map can now load **multiple
+recorded sessions simultaneously**. Each recording receives a distinct trajectory
+color, while one selected **Active replay** controls the video and master timeline.
+At any replay time, all loaded cars with data at that elapsed time are shown on
+the map together. Clicking a recorded location searches every loaded trajectory;
+choosing a pass can automatically switch the active replay and seek its video.
+
+Use **Add Session...** for one recording, **Add Recordings Folder...** to load all
+sessions below a parent directory, the **Active replay** drop-down to change the
+video-driving session, **Remove Active** to remove one comparison, and **Clear All**
+to clear the map.
+
+The map now uses **six measured Open Road lane-center references** when all six
+JSON files are present. The straight-road visual calibration uses rounded
+marking coordinates: outer edges at approximately `+/-12 m`, lane dividers at
+`+/-8 m` and `+/-4 m`, and median-side pavement edges at approximately
+`+/-0.6 m`. Curved markings are smoothly approximated from the measured lane
+center trajectories. The recorded participant trajectory is drawn more strongly
+than the reference layers so it remains easy to analyze.
 
 ## Recording output
 
@@ -124,7 +140,13 @@ QLabs_Drive_Replay/
 ├── ui/
 │   └── replay_video_window.py
 ├── data/
-│   └── open_road_reference.json
+│   ├── open_road_reference.json                 # legacy/fallback reference
+│   ├── open_road_reference_upper_right_lane.json
+│   ├── open_road_reference_upper_middle_lane.json
+│   ├── open_road_reference_upper_left_lane.json
+│   ├── open_road_reference_lower_right_lane.json
+│   ├── open_road_reference_lower_middle_lane.json
+│   └── open_road_reference_lower_left_lane.json
 └── recordings/
 ```
 
