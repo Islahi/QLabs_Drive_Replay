@@ -551,6 +551,16 @@ marker after its duration; its complete trajectory remains visible.
 If the active session's OBS and camera video paths are available, the separate
 Video window automatically loads its synchronized video sources.
 
+### Open several session videos at once
+
+When two or more recordings are loaded, click **Open All Session Videos**. The
+normal Video window remains attached to the **Active replay**. Every non-active
+session that has an available video opens in its own additional Video window.
+All of these windows follow the same elapsed replay time, Play/Pause state, and
+playback rate. Each window can independently select its own Front/Left/Right/Rear
+source. Click **Close Comparison Videos** to close the additional windows while
+keeping the active video window available.
+
 ---
 
 ## 14. Map window controls
@@ -589,7 +599,10 @@ On the straight section, the reviewer uses the rounded road calibration:
 
 The six JSON recordings are treated as the authoritative lane centers. On curved
 sections the painted lane dividers and boundaries are approximated smoothly from
-those measured trajectories.
+those measured trajectories. The grey pavement is filled directly between the
+derived outer and median-side boundaries, so its world width stays correct at
+every zoom level. The solid road edges and dashed lane markers are intentionally
+thicker than before so they remain easy to recognize under several trajectories.
 
 Map colors are:
 

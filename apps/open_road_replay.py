@@ -235,38 +235,59 @@ class ReplayMap(QWidget):
             path.lineTo(p)
         return path
 
+    def _make_band_path(self, edge_a, edge_b) -> QPainterPath:
+        """Build a filled road band between two already aligned world paths.
+
+        Filling the actual boundary polygon (instead of drawing a very thick
+        centerline pen) preserves the road width exactly at every zoom level.
+        """
+        path = QPainterPath()
+        if not edge_a or not edge_b:
+            return path
+        first = self.world_to_screen(float(edge_a[0][0]), float(edge_a[0][1]))
+        path.moveTo(first)
+        for point in edge_a[1:]:
+            path.lineTo(self.world_to_screen(float(point[0]), float(point[1])))
+        for point in reversed(edge_b):
+            path.lineTo(self.world_to_screen(float(point[0]), float(point[1])))
+        path.closeSubpath()
+        return path
+
     def _draw_six_lane_reference(self, painter: QPainter) -> None:
         geometry = self.lane_geometry
         if geometry is None:
             return
 
-        scale = self.pixels_per_metre()
+        # Fill the carriageways from their measured/derived world boundaries.
+        # This is intentionally polygon-based instead of a capped thick pen: the
+        # grey pavement therefore continues to cover all six lanes at any zoom.
+        road_fill = QColor(75, 81, 90)
+        painter.fillPath(
+            self._make_band_path(
+                geometry.outer_edges["upper"], geometry.median_edges["upper"]
+            ),
+            road_fill,
+        )
+        painter.fillPath(
+            self._make_band_path(
+                geometry.median_edges["lower"], geometry.outer_edges["lower"]
+            ),
+            road_fill,
+        )
 
-        # Two real three-lane carriageways, calibrated on the straight to
-        # approximately +0.6..+12 m and -12..-0.6 m. At whole-map zoom the
-        # pavement is kept visible with a small minimum pixel width.
-        carriageway_width_m = 11.4
-        surface_width_px = max(3.0, min(160.0, carriageway_width_m * scale))
-        surface_pen = QPen(QColor(75, 81, 90), surface_width_px)
-        surface_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        surface_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(surface_pen)
-        painter.drawPath(self._make_path(geometry.lane_centers["upper_middle"]))
-        painter.drawPath(self._make_path(geometry.lane_centers["lower_middle"]))
+        # Fill the approximate median/barrier between the calibrated +/-0.6 m
+        # median-side edges. It scales naturally because it is also a polygon.
+        painter.fillPath(
+            self._make_band_path(
+                geometry.median_edges["upper"], geometry.median_edges["lower"]
+            ),
+            QColor(164, 155, 128),
+        )
 
-        # Median/barrier: rounded straight calibration uses pavement edges at
-        # +/-0.6 m, so the visual barrier is about 1.2 m wide.
-        median_width_px = max(1.8, min(28.0, 1.2 * scale))
-        median_pen = QPen(QColor(164, 155, 128), median_width_px)
-        median_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        median_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(median_pen)
-        painter.drawPath(self._make_path(geometry.median_center))
-
-        # Solid road boundaries: +/-12 m outer edges and the two median-side
-        # pavement edges. Use cosmetic pens so boundaries remain legible when
-        # viewing the entire 50 km loop.
-        edge_pen = QPen(QColor(226, 230, 235), 1.35)
+        # Solid road boundaries: +/-12 m outer edges and both median-side edges.
+        # Cosmetic width is deliberate here: these are markings, so they should
+        # remain easy to identify even at the whole-map view.
+        edge_pen = QPen(QColor(246, 248, 250), 2.8)
         edge_pen.setCosmetic(True)
         painter.setPen(edge_pen)
         for path in geometry.outer_edges.values():
@@ -274,19 +295,17 @@ class ReplayMap(QWidget):
         for path in geometry.median_edges.values():
             painter.drawPath(self._make_path(path))
 
-        # Painted dashed lane dividers. These are approximated halfway between
-        # adjacent measured lane-center trajectories, producing +/-8 and +/-4 m
-        # on the calibrated straight section.
-        divider_pen = QPen(QColor(215, 221, 228), 1.05)
+        # Painted dashed lane dividers. These are intentionally thicker than the
+        # previous version to stay recognizable under multiple trajectory lines.
+        divider_pen = QPen(QColor(248, 249, 251), 2.6)
         divider_pen.setCosmetic(True)
         divider_pen.setStyle(Qt.PenStyle.DashLine)
         painter.setPen(divider_pen)
         for path in geometry.lane_dividers.values():
             painter.drawPath(self._make_path(path))
 
-        # Faint lane-center guides show exactly where the six measured QCar
-        # reference runs are. They stay secondary to both markings and session.
-        center_pen = QPen(QColor(132, 158, 178, 135), 0.75)
+        # Faint measured lane-center guides remain secondary analysis aids.
+        center_pen = QPen(QColor(132, 158, 178, 155), 1.0)
         center_pen.setCosmetic(True)
         center_pen.setStyle(Qt.PenStyle.DotLine)
         painter.setPen(center_pen)
@@ -295,7 +314,7 @@ class ReplayMap(QWidget):
 
     def _draw_legacy_reference(self, painter: QPainter) -> None:
         scale = self.pixels_per_metre()
-        road_width_px = max(3.0, min(90.0, TOTAL_APPROX_ROAD_WIDTH_M * scale))
+        road_width_px = max(3.0, TOTAL_APPROX_ROAD_WIDTH_M * scale)
         road_pen = QPen(QColor(82, 88, 96), road_width_px)
         road_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         road_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -514,6 +533,13 @@ class ReplayWindow(QMainWindow):
         self._slider_dragging = False
         self._resume_after_drag = False
 
+        # Optional synchronized comparison video windows. The normal video
+        # window always belongs to the active replay; when multi-video mode is
+        # enabled, each non-active loaded session receives its own VideoWindow.
+        self.multi_video_mode = False
+        self.comparison_video_windows: dict[str, VideoWindow] = {}
+        self.comparison_video_sinks: dict[str, VideoReplaySink] = {}
+
         root = QWidget()
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
@@ -630,9 +656,20 @@ class ReplayWindow(QMainWindow):
         self.load_video_button = QPushButton("Load Manual Video…")
         self.load_video_button.clicked.connect(self.choose_video)
         video_row.addWidget(self.load_video_button)
-        self.show_video_button = QPushButton("Show Video Window")
+        self.show_video_button = QPushButton("Show Active Video")
         self.show_video_button.clicked.connect(self.show_video_window)
         video_row.addWidget(self.show_video_button)
+
+        self.multi_video_button = QPushButton("Open All Session Videos")
+        self.multi_video_button.setCheckable(True)
+        self.multi_video_button.setToolTip(
+            "Open one synchronized video window for every loaded recording. "
+            "The active recording keeps the normal video window; comparison "
+            "recordings open in additional windows."
+        )
+        self.multi_video_button.toggled.connect(self.set_multi_video_mode)
+        video_row.addWidget(self.multi_video_button)
+
         video_row.addWidget(QLabel("Offset"))
         self.video_offset_spin = QDoubleSpinBox()
         self.video_offset_spin.setRange(-3600.0, 3600.0)
@@ -654,6 +691,9 @@ class ReplayWindow(QMainWindow):
         outer.addWidget(self.status_label)
 
         self.clock.playingChanged.connect(self.on_playing_changed)
+        self.clock.playingChanged.connect(self._sync_comparison_video_playing)
+        self.clock.rateChanged.connect(self._sync_comparison_video_rate)
+        self.clock.timeChanged.connect(self._sync_comparison_video_time)
         self.clock.durationChanged.connect(self.on_duration_changed)
         self.coordinator.poseChanged.connect(self.on_pose_changed)
         self.coordinator.sinkError.connect(self.on_sink_error)
@@ -790,6 +830,7 @@ class ReplayWindow(QMainWindow):
             )
         else:
             self._refresh_session_ui()
+            self._refresh_comparison_video_windows()
         return True
 
     def load_session(self, path: Path) -> None:
@@ -809,6 +850,8 @@ class ReplayWindow(QMainWindow):
         self.clock.seek(min(old_time, self.session.duration_s) if preserve_time else 0.0)
 
         label = self.session_labels[key]
+        self.video_window.setWindowTitle(f"Drive Replay Video — ACTIVE — {label}")
+        self._refresh_comparison_video_windows()
         if self.video_window.available_source_count() > 0:
             self.video_window.show()
             self.video_window.raise_()
@@ -837,6 +880,7 @@ class ReplayWindow(QMainWindow):
         if key is None or key not in self.loaded_sessions:
             return
         self.clock.pause()
+        self._close_comparison_video(key)
         try:
             index = self.session_order.index(key)
         except ValueError:
@@ -859,6 +903,7 @@ class ReplayWindow(QMainWindow):
 
     def clear_sessions(self) -> None:
         self.clock.pause()
+        self._close_all_comparison_videos()
         self.loaded_sessions.clear()
         self.session_labels.clear()
         self.session_colors.clear()
@@ -869,6 +914,121 @@ class ReplayWindow(QMainWindow):
         self.video_path_edit.clear()
         self._refresh_session_ui()
         self.status_label.setText("All recordings cleared.")
+
+    def set_multi_video_mode(self, enabled: bool) -> None:
+        self.multi_video_mode = bool(enabled)
+        self.multi_video_button.setText(
+            "Close Comparison Videos" if self.multi_video_mode else "Open All Session Videos"
+        )
+        if self.multi_video_mode:
+            self.show_video_window()
+            self._refresh_comparison_video_windows()
+            count = len(self.comparison_video_windows)
+            self.status_label.setText(
+                f"Multi-video mode enabled: active video + {count} comparison video window(s)."
+            )
+        else:
+            self._close_all_comparison_videos()
+            self.status_label.setText(
+                "Multi-video mode disabled. The active replay video remains available."
+            )
+
+    def _close_comparison_video(self, key: str) -> None:
+        sink = self.comparison_video_sinks.pop(key, None)
+        window = self.comparison_video_windows.pop(key, None)
+        if sink is not None:
+            try:
+                sink.set_playing(False)
+                sink.close()
+            except Exception:
+                pass
+        elif window is not None:
+            try:
+                window.close()
+            except Exception:
+                pass
+
+    def _close_all_comparison_videos(self) -> None:
+        for key in list(self.comparison_video_windows):
+            self._close_comparison_video(key)
+
+    def _refresh_comparison_video_windows(self) -> None:
+        if not self.multi_video_mode:
+            return
+
+        desired = {
+            key for key in self.session_order
+            if key in self.loaded_sessions and key != self.active_session_key
+        }
+        for key in list(self.comparison_video_windows):
+            if key not in desired:
+                self._close_comparison_video(key)
+
+        for key in self.session_order:
+            if key not in desired or key in self.comparison_video_windows:
+                continue
+            session = self.loaded_sessions[key]
+            label = self.session_labels[key]
+            window = VideoWindow()
+            window.setWindowTitle(f"Drive Replay Video — {label}")
+            sink = VideoReplaySink(window)
+            sink.set_session(session)
+            if window.available_source_count() <= 0:
+                # Do not leave empty windows around when a recording has no
+                # discoverable video file.
+                sink.close()
+                continue
+            self.comparison_video_windows[key] = window
+            self.comparison_video_sinks[key] = sink
+            sink.set_rate(self.clock.rate)
+            sink.set_playing(self.clock.playing)
+            t = min(self.clock.current_time_s, session.duration_s)
+            sink.force_sync()
+            sink.update_time(t, session.pose_at(t))
+            window.show()
+            window.raise_()
+
+    def _sync_comparison_video_time(self, time_s: float) -> None:
+        for key, sink in tuple(self.comparison_video_sinks.items()):
+            session = self.loaded_sessions.get(key)
+            if session is None or not session.times:
+                continue
+            t = min(max(float(time_s), float(session.times[0])), session.duration_s)
+            try:
+                sink.update_time(t, session.pose_at(t))
+            except Exception as exc:
+                self.status_label.setText(
+                    f"Comparison video sync failed for {self.session_labels.get(key, key)}: {exc}"
+                )
+
+    def _sync_comparison_video_playing(self, playing: bool) -> None:
+        for key, sink in tuple(self.comparison_video_sinks.items()):
+            session = self.loaded_sessions.get(key)
+            effective = bool(playing)
+            if session is not None and self.clock.current_time_s >= session.duration_s:
+                effective = False
+            try:
+                sink.set_playing(effective)
+            except Exception as exc:
+                self.status_label.setText(
+                    f"Comparison video playback failed for {self.session_labels.get(key, key)}: {exc}"
+                )
+
+    def _sync_comparison_video_rate(self, rate: float) -> None:
+        for key, sink in tuple(self.comparison_video_sinks.items()):
+            try:
+                sink.set_rate(rate)
+            except Exception as exc:
+                self.status_label.setText(
+                    f"Comparison video rate failed for {self.session_labels.get(key, key)}: {exc}"
+                )
+
+    def _force_comparison_video_sync(self) -> None:
+        for sink in tuple(self.comparison_video_sinks.values()):
+            try:
+                sink.force_sync()
+            except Exception:
+                pass
 
     def on_duration_changed(self, duration_s: float) -> None:
         self.timeline.setRange(0, max(0, int(round(duration_s * 1000.0))))
@@ -904,6 +1064,7 @@ class ReplayWindow(QMainWindow):
 
     def on_slider_released(self) -> None:
         self.coordinator.force_sync()
+        self._force_comparison_video_sync()
         self.clock.seek(self.timeline.value() / 1000.0)
         self._slider_dragging = False
         if self._resume_after_drag:
@@ -969,6 +1130,7 @@ class ReplayWindow(QMainWindow):
         if key != self.active_session_key:
             self.set_active_session(key, preserve_time=False)
         self.coordinator.force_sync()
+        self._force_comparison_video_sync()
         self.clock.seek(candidate.time_s)
         self.status_label.setText(
             f"Active: {self.session_labels.get(key, key)} — jumped to "
@@ -1006,17 +1168,20 @@ class ReplayWindow(QMainWindow):
             return
         if event.key() == Qt.Key.Key_Left:
             self.coordinator.force_sync()
+            self._force_comparison_video_sync()
             self.clock.seek(self.clock.current_time_s - 1.0)
             event.accept()
             return
         if event.key() == Qt.Key.Key_Right:
             self.coordinator.force_sync()
+            self._force_comparison_video_sync()
             self.clock.seek(self.clock.current_time_s + 1.0)
             event.accept()
             return
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
+        self._close_all_comparison_videos()
         self.coordinator.close()
         super().closeEvent(event)
 

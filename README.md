@@ -68,13 +68,23 @@ sessions below a parent directory, the **Active replay** drop-down to change the
 video-driving session, **Remove Active** to remove one comparison, and **Clear All**
 to clear the map.
 
+Use **Open All Session Videos** when several sessions are loaded. The normal video
+window remains attached to the active replay, while every non-active session with
+an available recording opens in its own synchronized video window. All windows
+follow the same elapsed replay time and playback rate, and each window can choose
+its own Front/Left/Right/Rear source. Toggle **Close Comparison Videos** to return
+to the single active video window.
+
 The map now uses **six measured Open Road lane-center references** when all six
 JSON files are present. The straight-road visual calibration uses rounded
 marking coordinates: outer edges at approximately `+/-12 m`, lane dividers at
 `+/-8 m` and `+/-4 m`, and median-side pavement edges at approximately
 `+/-0.6 m`. Curved markings are smoothly approximated from the measured lane
-center trajectories. The recorded participant trajectory is drawn more strongly
-than the reference layers so it remains easy to analyze.
+center trajectories. The pavement is filled directly between the derived road
+boundaries, so it keeps the correct world width when zooming instead of shrinking
+relative to the lanes. Road edges and dashed lane dividers are also drawn thicker
+for easier visual analysis. The recorded participant trajectory is drawn more
+strongly than the reference layers so it remains easy to analyze.
 
 ## Recording output
 
