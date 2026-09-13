@@ -199,3 +199,24 @@ Left/Right/Rear are recorded by one sequential multi-camera worker using one ded
 The default detector uses a **0.30 m/s rolling speed threshold**, **1.5 s sustained movement**, a **0.50 s speed averaging window**, and **0.30 m minimum displacement from the initial position**. These values are editable in the configuration window. Detection is only a suggestion; it is never applied until you choose **Apply to selected recording**.
 
 The **Use configured starts** checkbox applies the selected offset for each driver so their chosen launch becomes replay `00:00.000`. Uncheck it at any time to inspect every raw recording from its original start. OBS/CSI MP4 files and telemetry CSVs are never edited or cut.
+
+## Start-position normalization and 50 km straight analysis
+
+Replay now has an optional **Align map start X** display normalization. Enter a target X coordinate (default `-0.084 m`) and every loaded trajectory is shifted only in X so its Replay `00:00` sample begins at that X. The recorded Y coordinate is preserved, so drivers starting in different lanes remain in their real lane. This affects only the map display and map-click coordinate lookup; raw telemetry and video are unchanged.
+
+For driver-comparison work, click **50 km Straight Analysis…**. This window projects each recorded XY sample onto the reconstructed Open Road median route and expresses the sample as:
+
+- route station/progress along the lap;
+- signed lateral position across the road (approximately `+10/+6/+2/-2/-6/-10 m` at the six lane centers);
+- nearest lane center and lateral lane-center error.
+
+The curved Open Road lap is then unwrapped onto a fixed **0–50 km horizontal axis**. The six lane centers, lane dividers, road edges, and median stay horizontal, so gradual drift toward a neighboring lane is easy to see. Multiple recordings are drawn together using the same colors as the replay map, and the current replay time is shown with synchronized markers.
+
+Leave **Start each recording at 0 km** enabled for the recommended comparison mode. It makes the selected Replay start for every driver the 0 km origin, independent of small differences in the raw world-space starting X. This is separate from the optional top-down map X shift.
+
+The analysis window can export:
+
+- **PNG** — the current straightened six-lane comparison plot;
+- **CSV** — all loaded recordings with `replay_time_s`, raw world XYZ, route station, route progress, normalized 0–50 km distance, lateral position, nearest lane, lane-center position, and lane-center error.
+
+These analysis operations are non-destructive. No MP4, telemetry CSV, or CSI timestamp file is rewritten.

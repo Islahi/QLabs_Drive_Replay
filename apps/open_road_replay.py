@@ -11,6 +11,8 @@ third QLabs replay window can be attached later without changing session files.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
+import csv
 import math
 from pathlib import Path
 import sys
@@ -41,6 +43,8 @@ from PySide6.QtWidgets import (
 
 from core.replay_core import (
     OpenRoadLaneGeometry,
+    RoadCoordinateProjector,
+    StraightRoadSample,
     PassCandidate,
     SessionData,
     detect_sustained_motion_start,
@@ -169,6 +173,7 @@ class ReplayMap(QWidget):
                 "session": session,
                 "color": tuple(entry["color"]),
                 "display": self._display_cache[key],
+                "x_shift": float(entry.get("x_shift", 0.0)),
             }
         self.session_overlays = overlays
         self.active_session_key = active_key
@@ -231,14 +236,14 @@ class ReplayMap(QWidget):
         scale = max(self.pixels_per_metre(), 1e-12)
         return max(8.0, min(50.0, 12.0 / scale))
 
-    def _make_path(self, points) -> QPainterPath:
+    def _make_path(self, points, x_shift: float = 0.0) -> QPainterPath:
         path = QPainterPath()
         if not points:
             return path
-        p = self.world_to_screen(float(points[0][0]), float(points[0][1]))
+        p = self.world_to_screen(float(points[0][0]) + x_shift, float(points[0][1]))
         path.moveTo(p)
         for point in points[1:]:
-            p = self.world_to_screen(float(point[0]), float(point[1]))
+            p = self.world_to_screen(float(point[0]) + x_shift, float(point[1]))
             path.lineTo(p)
         return path
 
@@ -360,7 +365,7 @@ class ReplayMap(QWidget):
             session_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             session_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(session_pen)
-            painter.drawPath(self._make_path(entry["display"]))
+            painter.drawPath(self._make_path(entry["display"], float(entry.get("x_shift", 0.0))))
 
         if not self.session_overlays and self.session_display:
             session_pen = QPen(QColor(52, 183, 245), 3.0)
@@ -384,7 +389,8 @@ class ReplayMap(QWidget):
             if entry is None:
                 continue
             color = QColor(*entry["color"])
-            p = self.world_to_screen(pose.x, pose.y)
+            x_shift = float(entry.get("x_shift", 0.0))
+            p = self.world_to_screen(pose.x + x_shift, pose.y)
             active = key == self.active_session_key
             radius = 8.0 if active else 6.0
 
@@ -820,6 +826,299 @@ class StartAlignmentDialog(QDialog):
 
 
 
+class StraightRoadPlot(QWidget):
+    """Straightened six-lane 0..50 km comparison plot."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setMinimumSize(1050, 560)
+        self.entries: dict[str, dict] = {}
+        self.current_time_s = 0.0
+        self.x_max_km = 50.0
+        self.lat_min = -13.0
+        self.lat_max = 13.0
+
+    def set_entries(self, entries: list[dict]) -> None:
+        self.entries = {str(entry["key"]): entry for entry in entries}
+        self.update()
+
+    def set_time(self, time_s: float) -> None:
+        self.current_time_s = float(time_s)
+        self.update()
+
+    def _plot_rect(self):
+        left = 92.0
+        right = 24.0
+        top = 38.0
+        bottom = 58.0
+        return left, top, max(1.0, self.width() - left - right), max(1.0, self.height() - top - bottom)
+
+    def _screen(self, distance_km: float, lateral_m: float) -> QPointF:
+        left, top, width, height = self._plot_rect()
+        x = left + max(0.0, min(self.x_max_km, float(distance_km))) / self.x_max_km * width
+        y = top + (self.lat_max - float(lateral_m)) / (self.lat_max - self.lat_min) * height
+        return QPointF(x, y)
+
+    def _sample_at_time(self, entry: dict, time_s: float) -> StraightRoadSample | None:
+        samples: list[StraightRoadSample] = entry.get("samples", [])
+        times: list[float] = entry.get("times", [])
+        if not samples or not times or time_s < times[0] or time_s > times[-1]:
+            return None
+        right = bisect_right(times, float(time_s))
+        index = max(0, min(len(samples) - 1, right - 1))
+        return samples[index]
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(28, 31, 36))
+        left, top, width, height = self._plot_rect()
+
+        # Road surface and median are drawn in lateral coordinates, so the lane
+        # structure remains visually constant across the complete 50 km axis.
+        upper_top = self._screen(0.0, 12.0).y()
+        upper_bottom = self._screen(0.0, 0.6).y()
+        lower_top = self._screen(0.0, -0.6).y()
+        lower_bottom = self._screen(0.0, -12.0).y()
+        painter.fillRect(int(left), int(upper_top), int(width), int(upper_bottom - upper_top), QColor(75, 81, 90))
+        painter.fillRect(int(left), int(lower_top), int(width), int(lower_bottom - lower_top), QColor(75, 81, 90))
+        median_top = self._screen(0.0, 0.6).y()
+        median_bottom = self._screen(0.0, -0.6).y()
+        painter.fillRect(int(left), int(median_top), int(width), int(median_bottom - median_top), QColor(164, 155, 128))
+
+        # Vertical distance grid every 5 km, with stronger 10 km labels.
+        for km in range(0, 51, 5):
+            p0 = self._screen(float(km), self.lat_min)
+            p1 = self._screen(float(km), self.lat_max)
+            grid_pen = QPen(QColor(120, 126, 134, 75 if km % 10 else 115), 1.0)
+            grid_pen.setCosmetic(True)
+            painter.setPen(grid_pen)
+            painter.drawLine(p0, p1)
+            painter.setPen(QColor(218, 223, 228))
+            painter.drawText(QPointF(p0.x() - 12.0, top + height + 24.0), f"{km}")
+
+        # Lane boundaries and centers use the rounded straight calibration.
+        edge_pen = QPen(QColor(248, 249, 251), 2.8)
+        edge_pen.setCosmetic(True)
+        painter.setPen(edge_pen)
+        for lateral in (12.0, 0.6, -0.6, -12.0):
+            painter.drawLine(self._screen(0.0, lateral), self._screen(50.0, lateral))
+
+        divider_pen = QPen(QColor(250, 250, 250), 2.6)
+        divider_pen.setCosmetic(True)
+        divider_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(divider_pen)
+        for lateral in (8.0, 4.0, -4.0, -8.0):
+            painter.drawLine(self._screen(0.0, lateral), self._screen(50.0, lateral))
+
+        center_pen = QPen(QColor(132, 158, 178, 145), 1.0)
+        center_pen.setCosmetic(True)
+        center_pen.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(center_pen)
+        lane_labels = [
+            (10.0, "Upper Right"), (6.0, "Upper Middle"), (2.0, "Upper Left"),
+            (-2.0, "Lower Right"), (-6.0, "Lower Middle"), (-10.0, "Lower Left"),
+        ]
+        for lateral, label in lane_labels:
+            painter.drawLine(self._screen(0.0, lateral), self._screen(50.0, lateral))
+            painter.setPen(QColor(220, 225, 230))
+            y = self._screen(0.0, lateral).y() + 4.0
+            painter.drawText(QPointF(8.0, y), label)
+            painter.setPen(center_pen)
+
+        # Draw every driver's lateral trajectory over the straightened road.
+        for entry in self.entries.values():
+            samples = entry.get("samples", [])
+            if not samples:
+                continue
+            path = QPainterPath()
+            first = self._screen(samples[0].display_distance_km, samples[0].lateral_m)
+            path.moveTo(first)
+            for sample in samples[1:]:
+                if sample.display_distance_km < -0.1 or sample.display_distance_km > 50.1:
+                    continue
+                path.lineTo(self._screen(sample.display_distance_km, sample.lateral_m))
+            color = QColor(*entry["color"])
+            pen = QPen(color, 2.4 if entry.get("active") else 1.8)
+            pen.setCosmetic(True)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+
+            current = self._sample_at_time(entry, self.current_time_s)
+            if current is not None and 0.0 <= current.display_distance_km <= 50.0:
+                point = self._screen(current.display_distance_km, current.lateral_m)
+                painter.setPen(QPen(QColor(245, 248, 250), 1.3))
+                painter.setBrush(color)
+                radius = 6.0 if entry.get("active") else 4.5
+                painter.drawEllipse(point, radius, radius)
+
+        # Axis labels and legend.
+        painter.setPen(QColor(235, 239, 243))
+        painter.drawText(QPointF(left + width / 2.0 - 90.0, self.height() - 12.0), "Normalized route distance (km)")
+        painter.drawText(QPointF(left, 22.0), "Straightened Open Road — lateral position (m); lane centers ±10, ±6, ±2")
+
+        legend_x = left + width - 260.0
+        legend_y = top + 20.0
+        for row, entry in enumerate(list(self.entries.values())[:10]):
+            color = QColor(*entry["color"])
+            pen = QPen(color, 3.0 if entry.get("active") else 2.0)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(legend_x, legend_y + row * 18), QPointF(legend_x + 24.0, legend_y + row * 18))
+            painter.setPen(QColor(235, 239, 243))
+            label = str(entry["label"])
+            prefix = "ACTIVE — " if entry.get("active") else ""
+            painter.drawText(QPointF(legend_x + 31.0, legend_y + row * 18 + 5.0), prefix + label[:28])
+
+
+class StraightRoadAnalysisWindow(QMainWindow):
+    """Multi-session lateral-position view with CSV/PNG export."""
+
+    def __init__(self, owner, projector: RoadCoordinateProjector) -> None:
+        super().__init__(owner)
+        self.owner = owner
+        self.projector = projector
+        self.setWindowTitle("50 km Straightened Open Road Analysis")
+        self.resize(1320, 720)
+        self._plot_cache: dict[tuple[str, int, bool], list[StraightRoadSample]] = {}
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+
+        controls = QHBoxLayout()
+        layout.addLayout(controls)
+        self.normalize_check = QCheckBox("Start each recording at 0 km")
+        self.normalize_check.setChecked(True)
+        self.normalize_check.setToolTip(
+            "Subtract each recording's route station at Replay 00:00. This is the recommended spatial alignment for driver comparison."
+        )
+        self.normalize_check.toggled.connect(lambda _checked: self.refresh_from_owner())
+        controls.addWidget(self.normalize_check)
+
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh_from_owner)
+        controls.addWidget(refresh)
+
+        export_csv = QPushButton("Export Analysis CSV…")
+        export_csv.clicked.connect(self.export_csv)
+        controls.addWidget(export_csv)
+
+        export_png = QPushButton("Export Plot PNG…")
+        export_png.clicked.connect(self.export_png)
+        controls.addWidget(export_png)
+        controls.addStretch(1)
+
+        self.plot = StraightRoadPlot()
+        layout.addWidget(self.plot, 1)
+        self.status = QLabel(
+            "The curved Open Road is unwrapped to 0–50 km. Vertical position is signed lateral position across the six lanes."
+        )
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+    def refresh_from_owner(self) -> None:
+        entries: list[dict] = []
+        normalize = self.normalize_check.isChecked()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for key in self.owner.session_order:
+                session = self.owner.loaded_sessions.get(key)
+                if session is None:
+                    continue
+                cache_key = (key, id(session), bool(normalize))
+                samples = self._plot_cache.get(cache_key)
+                if samples is None:
+                    samples = self.projector.straightened_samples(
+                        session,
+                        normalize_start=normalize,
+                        display_length_m=50_000.0,
+                        max_points=7000,
+                    )
+                    self._plot_cache[cache_key] = samples
+                entries.append({
+                    "key": key,
+                    "label": self.owner.session_labels.get(key, Path(key).name),
+                    "color": self.owner.session_colors.get(key, (52, 183, 245)),
+                    "active": key == self.owner.active_session_key,
+                    "samples": samples,
+                    "times": [sample.time_s for sample in samples],
+                })
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.plot.set_entries(entries)
+        self.plot.set_time(self.owner.clock.current_time_s)
+        self.status.setText(
+            f"{len(entries)} recording(s) plotted. One reference lap ({self.projector.length_m/1000.0:.2f} km) is normalized to a 50.00 km horizontal axis. "
+            "CSV export includes route progress, lateral position, nearest lane, and lane-center error."
+        )
+
+    def set_time(self, time_s: float) -> None:
+        self.plot.set_time(time_s)
+
+    def export_png(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export straightened-road plot", "straightened_open_road.png", "PNG image (*.png)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        image = self.plot.grab()
+        if not image.save(path, "PNG"):
+            QMessageBox.warning(self, "Export failed", f"Could not save PNG:\n{path}")
+            return
+        self.status.setText(f"Plot exported to {path}")
+
+    def export_csv(self) -> None:
+        if not self.owner.loaded_sessions:
+            QMessageBox.information(self, "Nothing to export", "Load at least one recording first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export straightened-road data", "straightened_open_road.csv", "CSV file (*.csv)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        normalize = self.normalize_check.isChecked()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([
+                    "recording", "replay_time_s", "world_x_m", "world_y_m", "world_z_m",
+                    "route_station_m", "route_progress_m", "display_distance_km",
+                    "lateral_m", "nearest_lane", "lane_center_m", "lane_error_m",
+                ])
+                for key in self.owner.session_order:
+                    session = self.owner.loaded_sessions.get(key)
+                    if session is None:
+                        continue
+                    label = self.owner.session_labels.get(key, Path(key).name)
+                    samples = self.projector.straightened_samples(
+                        session,
+                        normalize_start=normalize,
+                        display_length_m=50_000.0,
+                        max_points=None,
+                    )
+                    for sample in samples:
+                        writer.writerow([
+                            label,
+                            f"{sample.time_s:.6f}", f"{sample.x:.6f}", f"{sample.y:.6f}", f"{sample.z:.6f}",
+                            f"{sample.route_station_m:.6f}", f"{sample.route_progress_m:.6f}", f"{sample.display_distance_km:.9f}",
+                            f"{sample.lateral_m:.6f}", sample.lane_name, f"{sample.lane_center_m:.6f}", f"{sample.lane_error_m:.6f}",
+                        ])
+        except Exception as exc:
+            QMessageBox.critical(self, "CSV export failed", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.status.setText(f"Analysis CSV exported to {path}")
+
+
 class ReplayWindow(QMainWindow):
     """Presentation layer for the replay system.
 
@@ -838,6 +1137,15 @@ class ReplayWindow(QMainWindow):
         self.resize(1320, 820)
 
         self.reference_path = reference_path
+        self.lane_geometry = lane_geometry
+        self.road_projector = (
+            RoadCoordinateProjector(
+                lane_geometry.median_center,
+                positive_side_point=lane_geometry.lane_centers["upper_middle"][0],
+            )
+            if lane_geometry is not None else None
+        )
+        self.analysis_window: StraightRoadAnalysisWindow | None = None
         self.session: SessionData | None = None
         # Raw recordings are always kept in memory unchanged. loaded_sessions
         # contains the current Replay view (raw or non-destructively shifted).
@@ -922,6 +1230,33 @@ class ReplayWindow(QMainWindow):
 
         self.reset_map_button = QPushButton("Reset Map")
         top.addWidget(self.reset_map_button)
+
+        position_row = QHBoxLayout()
+        outer.addLayout(position_row)
+        self.align_map_x_check = QCheckBox("Align map start X")
+        self.align_map_x_check.setToolTip(
+            "Display-only normalization: shift each trajectory in X so its Replay 00:00 point shares the target X. Y is preserved, so different lanes remain separate."
+        )
+        self.align_map_x_check.toggled.connect(self.on_position_alignment_changed)
+        position_row.addWidget(self.align_map_x_check)
+        position_row.addWidget(QLabel("Target X"))
+        self.align_map_x_spin = QDoubleSpinBox()
+        self.align_map_x_spin.setRange(-10000.0, 10000.0)
+        self.align_map_x_spin.setDecimals(3)
+        self.align_map_x_spin.setSingleStep(0.1)
+        self.align_map_x_spin.setValue(-0.084)
+        self.align_map_x_spin.setSuffix(" m")
+        self.align_map_x_spin.valueChanged.connect(self.on_position_alignment_changed)
+        position_row.addWidget(self.align_map_x_spin)
+
+        self.straight_analysis_button = QPushButton("50 km Straight Analysis…")
+        self.straight_analysis_button.setToolTip(
+            "Unwrap the Open Road into a straight 0–50 km six-lane view for lateral-position comparison and CSV/PNG export."
+        )
+        self.straight_analysis_button.clicked.connect(self.show_straight_analysis)
+        self.straight_analysis_button.setEnabled(lane_geometry is not None)
+        position_row.addWidget(self.straight_analysis_button)
+        position_row.addStretch(1)
 
         self.map_widget = ReplayMap(reference_loop, lane_geometry=lane_geometry)
         self.map_widget.mapClicked.connect(self.on_map_clicked)
@@ -1034,6 +1369,7 @@ class ReplayWindow(QMainWindow):
         self.clock.playingChanged.connect(self._sync_comparison_video_playing)
         self.clock.rateChanged.connect(self._sync_comparison_video_rate)
         self.clock.timeChanged.connect(self._sync_comparison_video_time)
+        self.clock.timeChanged.connect(self._sync_straight_analysis_time)
         self.clock.durationChanged.connect(self.on_duration_changed)
         self.coordinator.poseChanged.connect(self.on_pose_changed)
         self.coordinator.sinkError.connect(self.on_sink_error)
@@ -1099,6 +1435,7 @@ class ReplayWindow(QMainWindow):
                 "label": self.session_labels[key],
                 "session": session,
                 "color": self.session_colors[key],
+                "x_shift": self._map_x_shift(key),
             })
         return entries
 
@@ -1146,6 +1483,43 @@ class ReplayWindow(QMainWindow):
         self.clear_sessions_button.setEnabled(count > 0)
         self.active_session_combo.setEnabled(count > 0)
         self.configure_starts_button.setEnabled(count > 0)
+        self.straight_analysis_button.setEnabled(count > 0 and self.road_projector is not None)
+        if self.analysis_window is not None and self.analysis_window.isVisible():
+            self.analysis_window.refresh_from_owner()
+
+    def _map_x_shift(self, key: str) -> float:
+        session = self.loaded_sessions.get(key)
+        if session is None or not session.xs or not self.align_map_x_check.isChecked():
+            return 0.0
+        return float(self.align_map_x_spin.value()) - float(session.xs[0])
+
+    def on_position_alignment_changed(self, *_args) -> None:
+        self.map_widget.set_session_overlays(self._session_overlay_entries(), self.active_session_key)
+        self.map_widget.set_comparison_time(self.clock.current_time_s)
+        if self.align_map_x_check.isChecked():
+            self.status_label.setText(
+                f"Map X normalization enabled: each trajectory starts at X={self.align_map_x_spin.value():.3f} m; lane-dependent Y values are unchanged."
+            )
+        else:
+            self.status_label.setText("Map X normalization disabled; trajectories use their recorded world coordinates.")
+
+    def show_straight_analysis(self) -> None:
+        if self.road_projector is None:
+            QMessageBox.warning(self, "Six-lane reference required", "The straightened analysis requires the six Open Road lane reference files.")
+            return
+        if not self.loaded_sessions:
+            QMessageBox.information(self, "No recordings loaded", "Load one or more recordings before opening the 50 km analysis.")
+            return
+        if self.analysis_window is None:
+            self.analysis_window = StraightRoadAnalysisWindow(self, self.road_projector)
+        self.analysis_window.refresh_from_owner()
+        self.analysis_window.show()
+        self.analysis_window.raise_()
+        self.analysis_window.activateWindow()
+
+    def _sync_straight_analysis_time(self, time_s: float) -> None:
+        if self.analysis_window is not None and self.analysis_window.isVisible():
+            self.analysis_window.set_time(time_s)
 
     def configure_starts(self) -> None:
         if not self.raw_sessions:
@@ -1599,9 +1973,12 @@ class ReplayWindow(QMainWindow):
         nearest: tuple[str, PassCandidate] | None = None
         for key in self.session_order:
             session = self.loaded_sessions[key]
-            for candidate in session.find_passes(x, y, radius_m=radius):
+            # If map X normalization is enabled, transform the display click back
+            # into that recording's original world coordinate before searching.
+            raw_x = float(x) - self._map_x_shift(key)
+            for candidate in session.find_passes(raw_x, y, radius_m=radius):
                 matches.append((key, candidate))
-            candidate = session.nearest_sample(x, y)
+            candidate = session.nearest_sample(raw_x, y)
             if nearest is None or candidate.distance_m < nearest[1].distance_m:
                 nearest = (key, candidate)
 
@@ -1698,6 +2075,8 @@ class ReplayWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._close_all_comparison_videos()
+        if self.analysis_window is not None:
+            self.analysis_window.close()
         self.coordinator.close()
         super().closeEvent(event)
 

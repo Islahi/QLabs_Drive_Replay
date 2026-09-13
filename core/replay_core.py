@@ -590,6 +590,231 @@ class SessionData:
         return [[x, y, z] for x, y, z in zip(self.xs, self.ys, self.zs)]
 
 
+
+@dataclass(frozen=True)
+class RoadProjection:
+    """Projection of one world XY point into Open Road route coordinates."""
+
+    station_m: float
+    lateral_m: float
+    distance_to_reference_m: float
+
+
+@dataclass(frozen=True)
+class StraightRoadSample:
+    """One telemetry sample expressed on the straightened 50 km road."""
+
+    time_s: float
+    x: float
+    y: float
+    z: float
+    route_station_m: float
+    route_progress_m: float
+    display_distance_km: float
+    lateral_m: float
+    lane_name: str
+    lane_center_m: float
+    lane_error_m: float
+
+
+OPEN_ROAD_LANE_CENTER_OFFSETS_M = {
+    "upper_right": 10.0,
+    "upper_middle": 6.0,
+    "upper_left": 2.0,
+    "lower_right": -2.0,
+    "lower_middle": -6.0,
+    "lower_left": -10.0,
+}
+
+
+class RoadCoordinateProjector:
+    """Fast XY -> (route station, lateral offset) projector for Open Road.
+
+    The reference is normally the reconstructed median-center loop.  A compact
+    spatial grid keeps projection fast enough for long 20 Hz experiment logs.
+    Positive lateral is calibrated toward the upper carriageway, so the
+    straight-road lane centers remain approximately +10/+6/+2/-2/-6/-10 m.
+    """
+
+    def __init__(
+        self,
+        reference_loop: Sequence[Sequence[float]],
+        positive_side_point: Sequence[float] | None = None,
+        grid_cell_m: float = 250.0,
+    ) -> None:
+        points = [
+            [float(p[0]), float(p[1]), float(p[2]) if len(p) >= 3 else 0.0]
+            for p in reference_loop
+            if len(p) >= 2
+        ]
+        if len(points) < 2:
+            raise ValueError("Road-coordinate reference needs at least two points.")
+        if math.hypot(points[-1][0] - points[0][0], points[-1][1] - points[0][1]) > 1e-6:
+            points.append(list(points[0]))
+        self.points = points
+        self.cumulative = cumulative_xy_distances(points)
+        self.length_m = float(self.cumulative[-1])
+        if self.length_m <= 1e-6:
+            raise ValueError("Road-coordinate reference has zero length.")
+
+        self.grid_cell_m = max(25.0, float(grid_cell_m))
+        self._grid: dict[tuple[int, int], list[int]] = {}
+        for index, point in enumerate(self.points[:-1]):
+            cell = self._cell(point[0], point[1])
+            self._grid.setdefault(cell, []).append(index)
+
+        self.sign_factor = 1.0
+        if positive_side_point is not None and len(positive_side_point) >= 2:
+            raw = self._project_raw(float(positive_side_point[0]), float(positive_side_point[1]))
+            if raw[1] < 0.0:
+                self.sign_factor = -1.0
+
+    def _cell(self, x: float, y: float) -> tuple[int, int]:
+        return (math.floor(float(x) / self.grid_cell_m), math.floor(float(y) / self.grid_cell_m))
+
+    def _candidate_segments(self, x: float, y: float) -> list[int]:
+        cx, cy = self._cell(x, y)
+        candidates: set[int] = set()
+        for radius in (1, 2, 4):
+            for gx in range(cx - radius, cx + radius + 1):
+                for gy in range(cy - radius, cy + radius + 1):
+                    for vertex_index in self._grid.get((gx, gy), ()): 
+                        candidates.add(vertex_index)
+                        if vertex_index > 0:
+                            candidates.add(vertex_index - 1)
+                        if vertex_index + 1 < len(self.points) - 1:
+                            candidates.add(vertex_index + 1)
+            if candidates:
+                break
+        if not candidates:
+            return list(range(len(self.points) - 1))
+        return sorted(i for i in candidates if 0 <= i < len(self.points) - 1)
+
+    def _project_raw(self, x: float, y: float) -> tuple[float, float, float]:
+        best_distance_sq = math.inf
+        best_station = 0.0
+        best_lateral = 0.0
+        for index in self._candidate_segments(x, y):
+            a = self.points[index]
+            b = self.points[index + 1]
+            distance_sq, alpha = point_segment_distance_sq(x, y, a, b)
+            if distance_sq >= best_distance_sq:
+                continue
+            dx = float(b[0]) - float(a[0])
+            dy = float(b[1]) - float(a[1])
+            segment_length = math.hypot(dx, dy)
+            if segment_length <= 1e-12:
+                continue
+            qx = float(a[0]) + alpha * dx
+            qy = float(a[1]) + alpha * dy
+            signed_lateral = (dx * (y - qy) - dy * (x - qx)) / segment_length
+            best_distance_sq = distance_sq
+            best_station = self.cumulative[index] + alpha * segment_length
+            best_lateral = signed_lateral
+        return best_station % self.length_m, best_lateral, math.sqrt(best_distance_sq)
+
+    def project_xy(self, x: float, y: float) -> RoadProjection:
+        station, lateral, distance = self._project_raw(float(x), float(y))
+        return RoadProjection(station, lateral * self.sign_factor, distance)
+
+    def infer_direction(self, xs: Sequence[float], ys: Sequence[float]) -> float:
+        """Return +1 when telemetry follows reference station, otherwise -1."""
+        if not xs or len(xs) != len(ys):
+            return 1.0
+        first = self.project_xy(float(xs[0]), float(ys[0])).station_m
+        x0, y0 = float(xs[0]), float(ys[0])
+        count = len(xs)
+        probe_indices = list(range(1, min(count, 800), max(1, min(20, count // 50 or 1))))
+        if count > 1:
+            probe_indices.append(min(count - 1, 1600))
+        for index in probe_indices:
+            if math.hypot(float(xs[index]) - x0, float(ys[index]) - y0) < 20.0:
+                continue
+            station = self.project_xy(float(xs[index]), float(ys[index])).station_m
+            delta = station - first
+            if delta > self.length_m / 2.0:
+                delta -= self.length_m
+            elif delta < -self.length_m / 2.0:
+                delta += self.length_m
+            if abs(delta) >= 5.0:
+                return 1.0 if delta >= 0.0 else -1.0
+        return 1.0
+
+    @staticmethod
+    def nearest_lane(lateral_m: float) -> tuple[str, float, float]:
+        lane_name, center = min(
+            OPEN_ROAD_LANE_CENTER_OFFSETS_M.items(),
+            key=lambda item: abs(float(lateral_m) - item[1]),
+        )
+        return lane_name, float(center), float(lateral_m) - float(center)
+
+    def straightened_samples(
+        self,
+        session: "SessionData",
+        *,
+        normalize_start: bool = True,
+        display_length_m: float = 50_000.0,
+        max_points: int | None = None,
+    ) -> list[StraightRoadSample]:
+        """Convert a replay session into a normalized 0..50 km road plot.
+
+        ``route_progress_m`` is physical progress along the reconstructed loop.
+        ``display_distance_km`` scales one full reference loop to exactly 50 km,
+        which makes different recordings directly comparable on one fixed axis.
+        """
+        if session.sample_count <= 0:
+            return []
+        stride = 1
+        if max_points is not None and max_points > 1 and session.sample_count > max_points:
+            stride = max(1, math.ceil(session.sample_count / max_points))
+        indices = list(range(0, session.sample_count, stride))
+        if indices[-1] != session.sample_count - 1:
+            indices.append(session.sample_count - 1)
+
+        direction = self.infer_direction(session.xs, session.ys)
+        projections = [self.project_xy(session.xs[i], session.ys[i]) for i in indices]
+        origin_station = projections[0].station_m if normalize_start else 0.0
+
+        # Continuously unwrap station rather than using one modulo subtraction;
+        # this avoids a spurious 50 km jump from small backwards jitter at t=0.
+        progress_values: list[float] = [0.0 if normalize_start else direction * (projections[0].station_m - origin_station)]
+        running = progress_values[0]
+        previous_station = projections[0].station_m
+        for projection in projections[1:]:
+            delta = projection.station_m - previous_station
+            if delta > self.length_m / 2.0:
+                delta -= self.length_m
+            elif delta < -self.length_m / 2.0:
+                delta += self.length_m
+            running += direction * delta
+            progress_values.append(running)
+            previous_station = projection.station_m
+
+        if normalize_start:
+            progress_values = [max(0.0, value) for value in progress_values]
+
+        scale = float(display_length_m) / self.length_m
+        samples: list[StraightRoadSample] = []
+        for idx, projection, progress in zip(indices, projections, progress_values):
+            lane_name, lane_center, lane_error = self.nearest_lane(projection.lateral_m)
+            display_km = (progress * scale) / 1000.0
+            samples.append(
+                StraightRoadSample(
+                    time_s=float(session.times[idx]),
+                    x=float(session.xs[idx]),
+                    y=float(session.ys[idx]),
+                    z=float(session.zs[idx]),
+                    route_station_m=float(projection.station_m),
+                    route_progress_m=float(progress),
+                    display_distance_km=float(display_km),
+                    lateral_m=float(projection.lateral_m),
+                    lane_name=lane_name,
+                    lane_center_m=lane_center,
+                    lane_error_m=lane_error,
+                )
+            )
+        return samples
+
 def find_open_road_reference(explicit: Path | None, script_path: Path) -> Path:
     if explicit is not None:
         explicit = Path(explicit).expanduser().resolve()

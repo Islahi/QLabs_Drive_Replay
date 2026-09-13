@@ -9,7 +9,7 @@ from integrations.location_sources import QLabsQCarLocationSource
 from core.oop_interfaces import LocationReading, LocationSource, ReplaySink
 from integrations.qlabs_replay import QLabsReplaySink
 from core.recorder_core import RecorderWorker
-from core.replay_core import SessionData, build_open_road_lane_geometry
+from core.replay_core import SessionData, RoadCoordinateProjector, build_open_road_lane_geometry
 from integrations.replay_sinks import MapReplaySink, VideoReplaySink
 
 
@@ -173,6 +173,48 @@ class OOPArchitectureTests(unittest.TestCase):
         self.assertAlmostEqual(geometry.lane_dividers["lower_middle_left"][0][1], -8.0, places=6)
         self.assertAlmostEqual(geometry.median_edges["upper"][0][1], 0.6, places=6)
         self.assertAlmostEqual(geometry.median_edges["lower"][0][1], -0.6, places=6)
+
+
+
+    def test_road_projector_preserves_lane_side_and_straightens_progress(self) -> None:
+        def lane(y: float) -> list[list[float]]:
+            return [[0.0, y, 0.0], [100.0, y, 0.0], [100.0, y + 40.0, 0.0], [0.0, y + 40.0, 0.0], [0.0, y, 0.0]]
+
+        geometry = build_open_road_lane_geometry(
+            {
+                "upper_right": lane(10.0),
+                "upper_middle": lane(6.0),
+                "upper_left": lane(2.0),
+                "lower_right": lane(-2.0),
+                "lower_middle": lane(-6.0),
+                "lower_left": lane(-10.0),
+            },
+            sample_count=80,
+        )
+        projector = RoadCoordinateProjector(
+            geometry.median_center,
+            positive_side_point=[50.0, 6.0, 0.0],
+            grid_cell_m=50.0,
+        )
+        upper = projector.project_xy(50.0, 6.0)
+        lower = projector.project_xy(50.0, -6.0)
+        self.assertGreater(upper.lateral_m, 5.0)
+        self.assertLess(lower.lateral_m, -5.0)
+
+        session = SessionData(
+            Path("."), {},
+            [0.0, 1.0, 2.0, 3.0],
+            [10.0, 30.0, 50.0, 70.0],
+            [6.0, 6.0, 6.0, 6.0],
+            [0.0, 0.0, 0.0, 0.0],
+        )
+        samples = projector.straightened_samples(
+            session, normalize_start=True, display_length_m=50_000.0
+        )
+        self.assertAlmostEqual(samples[0].display_distance_km, 0.0, places=6)
+        self.assertGreater(samples[-1].display_distance_km, samples[1].display_distance_km)
+        self.assertEqual(samples[0].lane_name, "upper_middle")
+        self.assertLess(abs(samples[0].lane_error_m), 0.5)
 
 
 

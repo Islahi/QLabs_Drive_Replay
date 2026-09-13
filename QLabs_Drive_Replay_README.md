@@ -1,411 +1,98 @@
-# QLabs Drive Replay
+# QLabs Drive Replay — synchronized recorder + two-window reviewer
 
-Synchronized experiment recording and interactive replay for the Quanser **QLabs Open Road** workspace.
+This repository keeps the existing grouped OOP design and adds synchronized
+experiment recording **inside the existing recorder/replay codebase**.
 
-The project is designed around one experiment clock. A single **START SESSION** button starts the OBS recording, QCar telemetry logging, and optional QLabs side/rear camera recordings. The generated session can then be reviewed using two synchronized windows:
+## Current workflow
 
-1. **Open Road map + replay timeline**
-2. **Recorded video window**
-
-A future QLabs replay window is intentionally **not exposed or implemented in the current user interface**.
-
----
-
-## 1. What the program records
-
-The current recording setup is:
-
-| Source | How it is recorded | Default |
-|---|---|---|
-| QLabs/QCar front view | OBS records the QLabs application window | Required |
-| QCar position and rotation | QLabs world transform | 20 Hz |
-| Left CSI camera | Python/QLabs image capture | Enabled, 15 fps |
-| Right CSI camera | Python/QLabs image capture | Enabled, 15 fps |
-| Rear CSI camera | Python/QLabs image capture | Enabled, 15 fps |
-
-The recorder does **not** drive the QCar. Drive it using your normal keyboard/controller/autonomous-driving program while the recorder is running.
-
-When recording starts, the program automatically possesses the selected QCar's **front CSI camera**, so the main QLabs application window becomes the front-camera view that OBS records.
-
----
-
-# Part A — First-time setup
-
-You only need to perform most of this section once on a computer.
-
-## 2. Requirements
-
-You need:
-
-- Windows with Quanser QLabs installed and working
-- Python 3.10 or newer
-- Quanser QLabs Python `qvl` package
-- OBS Studio
-- PySide6
-- `obsws-python`
-- OpenCV
-- NumPy
-
-The repository's pip dependencies are listed in `requirements.txt`:
-
-```text
-PySide6>=6.5
-obsws-python>=1.7
-opencv-python>=4.8
-numpy>=1.24
-```
-
-> **Important:** use the same Python environment in which your existing Quanser/QLabs Python scripts already work. The `qvl` package is not installed by this repository's `requirements.txt`.
-
----
-
-## 3. Install the Python dependencies
-
-Open **Command Prompt** or **PowerShell**, change into the repository folder, and run:
-
-```bat
-cd C:\path\to\QLabs_Drive_Replay
-python -m pip install -r requirements.txt
-```
-
-For example, if the repository is in Documents:
-
-```bat
-cd C:\Users\YourName\Documents\QLabs_Drive_Replay
-python -m pip install -r requirements.txt
-```
-
-### Verify the Python environment
+### Recorder: one button
 
 Run:
 
-```bat
-python -c "import PySide6, obsws_python, cv2, numpy; from qvl.qlabs import QuanserInteractiveLabs; print('Recorder dependencies OK')"
-```
-
-If it prints:
-
-```text
-Recorder dependencies OK
-```
-
-then the Python side is ready.
-
-If `qvl` cannot be imported, you are probably running a different Python installation from the one used by your Quanser programs.
-
----
-
-# Part B — Configure OBS
-
-## 4. Create an OBS scene for the QLabs window
-
-The main experiment video is the **QLabs application window showing the QCar front camera**.
-
-Open OBS Studio and create a scene for QLabs:
-
-1. Start **OBS Studio**.
-2. In **Scenes**, create or select a scene such as `QLabs Recording`.
-3. In **Sources**, click **+**.
-4. Add a **Window Capture** source.
-5. Select the QLabs application window.
-6. Resize/crop it so the part of QLabs you want to preserve is visible in the OBS preview.
-7. Make sure the source is visible and not hidden.
-
-You do **not** need to manually switch QLabs to the front camera before each experiment. The recorder attempts to do this automatically when **START SESSION** is pressed.
-
-### Recommended OBS recording format
-
-For the easiest playback in the current replay application, use a common video format such as **MP4** with a codec supported by your Windows installation.
-
-The actual OBS recording remains in the recording directory configured in OBS. When the session stops, the recorder asks OBS for the final output path and saves that path into `session.json`.
-
----
-
-## 5. Enable OBS WebSocket
-
-The one-button recorder controls OBS through OBS WebSocket.
-
-In OBS:
-
-1. Open **Tools**.
-2. Open **WebSocket Server Settings**.
-3. Enable the WebSocket server.
-4. Leave the server port at **4455** unless you specifically need another port.
-5. If authentication/password protection is enabled, note the password because you must enter the same password in the recorder.
-6. Apply/close the settings.
-
-The recorder defaults are:
-
-```text
-OBS host: localhost
-OBS port: 4455
-```
-
-If OBS and the recorder run on the same computer, `localhost` is normally correct.
-
-### Important OBS rule
-
-**Do not manually start OBS recording before pressing START SESSION.**
-
-The recorder intentionally refuses to begin if OBS is already recording because it would not know exactly where the experiment timeline begins in that video.
-
----
-
-# Part C — Prepare QLabs
-
-## 6. Load Open Road and prepare the QCar
-
-Before starting the recorder:
-
-1. Start **QLabs**.
-2. Load the **Open Road** workspace.
-3. Make sure the QCar2 you want to record already exists.
-4. Confirm its actor number.
-
-The recorder defaults to:
-
-```text
-QLabs host: localhost
-QCar actor: 0
-```
-
-If your car is `QCar2 actor 1`, change the **QCar actor** field in the recorder to `1`.
-
-The recorder **does not spawn the QCar**. It connects to an existing actor and reads its world transform.
-
----
-
-# Part D — Record an experiment
-
-## 7. Start the recorder program
-
-The easiest method on Windows is to double-click:
-
-```text
-run_recorder.bat
-```
-
-You can also run it from a terminal:
-
-```bat
+```bash
 python run_recorder.py
 ```
 
-A window titled:
+Prepare QLabs Open Road with the target QCar already present, and prepare an OBS
+scene that captures the QLabs application window. OBS WebSocket must be enabled.
 
-```text
-QLabs Open Road Session Recorder
+Press **START SESSION** once. The recorder then:
+
+1. connects to the selected QCar in QLabs;
+2. forces the QLabs application view to the QCar **front CSI camera**;
+3. connects to OBS WebSocket and starts OBS recording;
+4. estimates video `t=0` from OBS's reported recording duration;
+5. records unfiltered QCar telemetry at the requested rate (default 20 Hz);
+6. optionally records left/right/rear QLabs CSI cameras to separate MP4 files;
+7. writes OBS/video clock correlation data for replay synchronization.
+
+Press the same button again (**STOP SESSION**) to stop and finalize everything.
+
+The recorder refuses to start a synchronized session if OBS is already
+recording, because it would not know where the experiment video begins.
+
+### Replay: exactly two active windows
+
+Run:
+
+```bash
+python run_replay.py
 ```
 
-will appear.
-
----
-
-## 8. Recorder window settings
-
-### QLabs / telemetry
-
-**QLabs host**
-
-```text
-localhost
-```
-
-Use this when QLabs is running on the same computer.
-
-**QCar actor**
-
-```text
-0
-```
-
-Change this only when you want to record another existing QCar actor.
-
-**Telemetry rate**
-
-```text
-20 Hz
-```
-
-20 Hz is the recommended default. Unlike the old map logger, this recorder does **not** discard points based on distance. It records the experiment timeline continuously, including periods when the vehicle is stopped.
-
----
-
-### OBS WebSocket
-
-Use the same values configured in OBS:
-
-```text
-OBS host:     localhost
-OBS port:     4455
-OBS password: your password, or blank if no password is configured
-```
-
----
-
-### Additional QCar camera recordings
-
-The current additional-camera options are:
-
-```text
-Left CSI
-Right CSI
-Rear CSI
-```
-
-All three are enabled by default.
-
-The front CSI camera is intentionally **not recorded a second time by Python**, because the front view is already shown in the main QLabs window and captured by OBS.
-
-The default additional-camera frame rate is:
-
-```text
-15 fps
-```
-
-For an initial test you can leave all three selected. If your computer or QLabs has difficulty maintaining all streams, try reducing the camera FPS or temporarily disabling one or more additional cameras.
-
----
-
-### Session label
-
-The label is optional but strongly recommended for experiment organization.
-
-Examples:
-
-```text
-participant_001_run_01
-participant_001_baseline
-participant_002_drowsy_run
-```
-
-The final folder name automatically includes the date/time followed by the label, for example:
-
-```text
-2026-09-10_091530_participant_001_run_01
-```
-
----
-
-### Recording folder
-
-By default, recordings are saved under:
-
-```text
-QLabs_Drive_Replay\recordings\
-```
-
-You can change this in the recorder using **Browse...**.
-
----
-
-## 9. Start everything with one button
-
-Before pressing the button, check:
-
-- QLabs is open.
-- Open Road is loaded.
-- The requested QCar actor exists.
-- OBS is open.
-- The OBS QLabs Window Capture scene is selected and visible.
-- OBS WebSocket is enabled.
-- OBS is **not already recording**.
-
-Now press:
-
-```text
-START SESSION
-```
-
-The recorder performs the startup automatically in this order:
-
-```text
-Connect to QLabs
-      ↓
-Verify the selected QCar actor
-      ↓
-Possess the QCar FRONT CSI camera
-      ↓
-Connect/authenticate to OBS WebSocket
-      ↓
-Start OBS recording
-      ↓
-Wait until OBS reports recording is active
-      ↓
-Estimate OBS video t = 0
-      ↓
-Start OBS synchronization log
-      ↓
-Start optional Left / Right / Rear camera recorders
-      ↓
-Start continuous QCar telemetry
-```
-
-The large button changes to:
-
-```text
-STOP SESSION
-```
-
-Once initialization has completed successfully, the status area will show that the session is recording.
-
-### What to watch during recording
-
-The recorder displays:
-
-- elapsed session time;
-- number of telemetry samples;
-- dropped telemetry count;
-- OBS recording state;
-- frame count for each selected CSI camera;
-- duplicated-frame count when a camera request falls behind.
-
-A typical status might look like:
-
-```text
-Elapsed: 00:04:12.350
-Telemetry: 5,047 samples   Dropped: 0
-OBS: RECORDING
-Cameras: left: 3,785 frames (0 dup) | right: ... | rear: ...
-```
-
-At this point, drive the QCar normally using your experiment/control software.
-
----
-
-## 10. Stop and finalize the experiment
-
-At the end of the run, press:
-
-```text
-STOP SESSION
-```
-
-Do not immediately close the application. Wait until it reports that the session has completed.
-
-The program stops/finalizes:
-
-1. additional CSI camera recordings;
-2. OBS synchronization logging;
-3. OBS recording;
-4. QLabs telemetry connection;
-5. `session.json` metadata.
-
-After successful completion, the status area shows the session folder and, when reported by OBS, the path to the main OBS video.
-
-If you try to close the recorder while a recording is still active, the program asks whether it should stop and finalize the recording first.
-
----
-
-# Part E — Understand the recorded files
-
-## 11. Session folder structure
-
-A typical recording looks like:
+The current reviewer intentionally opens only:
+
+1. **Map + timeline window**
+2. **Video window**
+
+There is **no QLabs replay UI** in this version. The old integration module is
+left dormant so a small optional third QLabs replay window can be added later
+without changing the session format.
+
+When a synchronized session is loaded, the video window automatically discovers
+available sources such as:
+
+- QLabs Front (OBS)
+- Left CSI
+- Right CSI
+- Rear CSI
+
+Switching camera keeps the same experiment time. The map can now load **multiple
+recorded sessions simultaneously**. Each recording receives a distinct trajectory
+color, while one selected **Active replay** controls the video and master timeline.
+At any replay time, all loaded cars with data at that elapsed time are shown on
+the map together. Clicking a recorded location searches every loaded trajectory;
+choosing a pass can automatically switch the active replay and seek its video.
+
+Use **Add Session...** for one recording, **Add Recordings Folder...** to load all
+sessions below a parent directory, the **Active replay** drop-down to change the
+video-driving session, **Remove Active** to remove one comparison, and **Clear All**
+to clear the map.
+
+Use **Open All Session Videos** when several sessions are loaded. The normal video
+window remains attached to the active replay, while every non-active session with
+an available recording opens in its own synchronized video window. All windows
+follow the same elapsed replay time and playback rate, and each window can choose
+its own Front/Left/Right/Rear source. Toggle **Close Comparison Videos** to return
+to the single active video window.
+
+The map now uses **six measured Open Road lane-center references** when all six
+JSON files are present. The straight-road visual calibration uses rounded
+marking coordinates: outer edges at approximately `+/-12 m`, lane dividers at
+`+/-8 m` and `+/-4 m`, and median-side pavement edges at approximately
+`+/-0.6 m`. Curved markings are smoothly approximated from the measured lane
+center trajectories. The pavement is filled directly between the derived road
+boundaries, so it keeps the correct world width when zooming instead of shrinking
+relative to the lanes. Road edges and dashed lane dividers are also drawn thicker
+for easier visual analysis. The recorded participant trajectory is drawn more
+strongly than the reference layers so it remains easy to analyze.
+
+## Recording output
+
+A typical session is:
 
 ```text
 recordings/
-└── 2026-09-10_091530_participant_001_run_01/
+└── 2026-09-10_090000_participant_001/
     ├── session.json
     ├── location.csv
     ├── obs_sync.csv
@@ -417,573 +104,83 @@ recordings/
     └── csi_rear_frames.csv
 ```
 
-The OBS front video normally remains in the OBS recording folder rather than being copied into the session directory.
+The OBS recording normally remains in the OBS recording directory. Its absolute
+path is stored in `session.json`. If you later copy that video into the session
+folder, the reviewer also searches there by filename.
 
-Its absolute file path is stored in:
+## Synchronization model
 
-```text
-session.json
-```
+Session v2 timestamps are referenced to the estimated first OBS-recorded frame.
+They are **not normalized to the first telemetry sample** during replay.
 
-### `location.csv`
-
-This is the main synchronized QCar telemetry file.
-
-Columns are:
+`obs_sync.csv` records:
 
 ```text
-time_s
-scheduled_time_s
-x
-y
-z
-roll_rad
-pitch_rad
-yaw_rad
-valid
+session_time_s,obs_duration_s,...
 ```
 
-`time_s` is aligned to the experiment/OBS timebase.
-
-`scheduled_time_s` is also saved so timing jitter can be diagnosed later.
-
----
-
-### `obs_sync.csv`
-
-This records correspondence between the Python session clock and OBS's reported recording duration:
+Side-camera timestamp files record:
 
 ```text
-session_time_s
-obs_duration_s
-difference_s
-output_timecode
-output_bytes
+frame_index,video_time_s,session_time_s,...
 ```
 
-The replay program uses this mapping rather than assuming that pressing the OBS start command and the first encoded video frame happened at exactly the same instant.
-
----
-
-### `csi_*_frames.csv`
-
-Each additional QLabs camera has a timestamp sidecar associated with its MP4 file.
-
-The replay program uses those timestamps to keep Left/Right/Rear video synchronized with the same experiment timeline as the OBS front video.
-
----
-
-# Part F — Replay a recorded experiment
-
-## 12. Start the replay program
-
-Double-click:
-
-```text
-run_replay.bat
-```
-
-or run:
-
-```bat
-python run_replay.py
-```
-
-The current reviewer opens **two windows**:
-
-1. **Map + timeline**
-2. **Video**
-
-There is intentionally **no QLabs replay window or QLabs replay button in the current version**.
-
----
-
-## 13. Load one or multiple sessions
-
-The reviewer now supports **multiple recorded drives on the map at the same time**.
-One recording is the **active replay**: its video and duration control the master
-timeline. Every other loaded recording stays visible as a comparison trajectory,
-and its QCar marker is placed at the same elapsed session time.
-
-### Add one session
-
-1. Click **Add Session...**.
-2. Select the recording's **session folder**.
-
-Example:
-
-```text
-recordings\2026-09-10_091530_participant_001_run_01
-```
-
-Select the folder itself — not `location.csv`. The program reads `session.json`
-and `location.csv` automatically.
-
-Repeat **Add Session...** for additional participants/runs. Each trajectory gets
-a different persistent color. The most recently added session becomes the active
-replay by default.
-
-### Add an entire recordings folder
-
-If many session folders are stored under the same parent directory, click
-**Add Recordings Folder...** and select that parent directory. The reviewer
-searches below it for `session.json` files and loads every valid recording that
-is not already open.
-
-### Choose the active replay
-
-Use the **Active replay** drop-down at the top of the map window. Changing the
-active recording:
-
-- keeps every loaded trajectory visible;
-- switches the Video window to that recording's available video sources;
-- changes the timeline duration to that recording;
-- preserves the current elapsed time when possible.
-
-Use **Remove Active** to remove only the selected recording, or **Clear All** to
-remove every comparison recording.
-
-The comparison clock is **session-relative**. For example, at replay time
-`00:05:00`, every loaded car with telemetry at five minutes is shown at its own
-five-minute position. A shorter recording simply stops showing a current-position
-marker after its duration; its complete trajectory remains visible.
-
-If the active session's OBS and camera video paths are available, the separate
-Video window automatically loads its synchronized video sources.
-
-### Open several session videos at once
-
-When two or more recordings are loaded, click **Open All Session Videos**. The
-normal Video window remains attached to the **Active replay**. Every non-active
-session that has an available video opens in its own additional Video window.
-All of these windows follow the same elapsed replay time, Play/Pause state, and
-playback rate. Each window can independently select its own Front/Left/Right/Rear
-source. Click **Close Comparison Videos** to close the additional windows while
-keeping the active video window available.
-
----
-
-## 14. Map window controls
-
-The map uses the six measured Open Road lane-center files when they are available:
-
-```text
-data\open_road_reference_upper_right_lane.json
-data\open_road_reference_upper_middle_lane.json
-data\open_road_reference_upper_left_lane.json
-data\open_road_reference_lower_right_lane.json
-data\open_road_reference_lower_middle_lane.json
-data\open_road_reference_lower_left_lane.json
-```
-
-`data\open_road_reference.json` is retained as the legacy/fallback reference.
-
-On the straight section, the reviewer uses the rounded road calibration:
-
-```text
-+12 m   upper outer road edge
-+10 m   upper-right lane center
- +8 m   upper lane divider
- +6 m   upper-middle lane center
- +4 m   upper lane divider
- +2 m   upper-left lane center
-+0.6 m  upper median-side pavement edge
--0.6 m  lower median-side pavement edge
- -2 m   lower-right lane center
- -4 m   lower lane divider
- -6 m   lower-middle lane center
- -8 m   lower lane divider
--10 m   lower-left lane center
--12 m   lower outer road edge
-```
-
-The six JSON recordings are treated as the authoritative lane centers. On curved
-sections the painted lane dividers and boundaries are approximated smoothly from
-those measured trajectories. The grey pavement is filled directly between the
-derived outer and median-side boundaries, so its world width stays correct at
-every zoom level. The solid road edges and dashed lane markers are intentionally
-thicker than before so they remain easy to recognize under several trajectories.
-
-Map colors are:
-
-```text
-White/gray solid  = outer and median-side road boundaries
-White/gray dashed = lane dividers
-Faint dotted      = six measured lane-center references
-Colored lines     = loaded recorded QCar trajectories
-Thicker color     = active replay trajectory
-Colored markers   = each QCar position at the shared elapsed replay time
-```
-
-Each loaded session keeps a distinct color. The active trajectory is thicker,
-and current car markers are labeled so overlapping participants/runs can still
-be distinguished.
-
-Controls:
-
-| Action | Result |
-|---|---|
-| Left-click any recorded route | Choose the recording/pass, make it active if needed, and jump to that time |
-| Mouse wheel | Zoom |
-| Middle/right-button drag | Pan |
-| Timeline drag | Seek replay time |
-| Play/Pause | Start/stop replay |
-| Space | Play/Pause |
-| Left arrow | Move back 1 second |
-| Right arrow | Move forward 1 second |
-
-Playback rates available in the map/timeline window are:
-
-```text
-0.25×
-0.5×
-1×
-2×
-4×
-```
-
-### Locations visited more than once
-
-If one or more loaded QCars passed a clicked location multiple times, the
-reviewer does not guess. A menu groups candidates by recording and lists each
-pass time, for example:
-
-```text
-participant_001
-    Pass 1: 00:31:14.550
-    Pass 2: 01:20:47.300
-
-participant_002
-    Pass 1: 00:30:58.100
-```
-
-Choosing a candidate automatically makes that recording active, switches the
-Video window to it, and seeks both windows to that pass.
-
----
-
-# Part G — Video window
-
-## 15. Change camera while keeping the same time
-
-The Video window discovers all available session sources, typically:
-
-```text
-QLabs Front (OBS)
-Left CSI
-Right CSI
-Rear CSI
-```
-
-Use the **Camera** drop-down at the top of the Video window.
-
-Changing from one camera to another preserves the same experiment time. For example, if the replay is at:
-
-```text
-00:42:17.250
-```
-
-switching from Front to Rear attempts to show the rear-camera frame corresponding to the same `00:42:17.250` session time.
-
-The Video window also provides:
-
-- **Move to Next Screen** — useful with two monitors;
-- **Full Screen**;
-- `Esc` to exit full-screen mode.
-
----
-
-## 16. Manual video loading and fine synchronization
-
-Normally the front OBS video is discovered from `session.json` automatically.
-
-If the OBS video was moved, renamed, or is otherwise not found, the map window contains:
-
-```text
-Load Manual Video...
-```
-
-which lets you choose a replacement video file.
-
-There is also a manual **Offset** control in seconds for fine adjustment.
-
-Use this only when visual validation shows a small remaining synchronization error.
-
-The recorded synchronization files remain the normal source of alignment.
-
-### If you move the OBS video after recording
-
-The simplest options are:
-
-1. leave the video at the path stored in `session.json`; or
-2. copy the video into the session folder using the **same filename**; or
-3. use **Load Manual Video...** during replay.
-
-The reviewer checks the stored path first and also checks the session folder for the same basename.
-
----
-
-# Part H — Recommended validation before a long experiment
-
-## 17. Perform a short synchronization test first
-
-Before recording another one- or two-hour experiment, perform a **1–2 minute validation run**.
-
-Suggested test:
-
-1. Open QLabs Open Road.
-2. Put QCar actor 0 on a recognizable section of road.
-3. Open OBS with the QLabs capture scene ready.
-4. Start `run_recorder.bat`.
-5. Leave Left/Right/Rear enabled.
-6. Press **START SESSION**.
-7. Confirm QLabs switches to the QCar front view.
-8. Confirm the GUI shows `OBS: RECORDING`.
-9. Drive the QCar past a recognizable location.
-10. Stop there briefly if useful for synchronization checking.
-11. Continue driving for another short distance.
-12. Press **STOP SESSION**.
-13. Wait for `Session complete`.
-14. Start `run_replay.bat`.
-15. Load the new session folder.
-16. Click the recognizable point on the blue route.
-17. Verify the front video shows the correct location/time.
-18. Switch Front → Left → Right → Rear.
-19. Check that all available camera views correspond to the same moment.
-
-Only after this passes should you rely on the setup for a long experimental session.
-
----
-
-# Part I — Troubleshooting
-
-## 18. `ModuleNotFoundError: qvl`
-
-You are probably using the wrong Python environment.
-
-Check:
-
-```bat
-python -c "from qvl.qlabs import QuanserInteractiveLabs; print('qvl OK')"
-```
-
-Use the Python installation/environment in which your existing Quanser scripts already run.
-
----
-
-## 19. OBS connection/authentication fails
-
-Check all of the following:
-
-- OBS is running.
-- OBS WebSocket server is enabled.
-- The recorder port matches the OBS port.
-- Default port is `4455`.
-- The password in the recorder matches OBS.
-- If OBS is on the same computer, use `localhost`.
-
----
-
-## 20. Recorder says OBS is already recording
-
-Stop the existing OBS recording manually, then press **START SESSION** again.
-
-This restriction is deliberate so the program can establish the experiment video start time correctly.
-
----
-
-## 21. `QCar2 actor ... does not exist in QLabs`
-
-The actor number in the recorder does not match the QCar in the loaded workspace.
-
-Check the actual QCar actor number and enter it in **QCar actor** before starting.
-
----
-
-## 22. QLabs does not switch to the front camera
-
-Check that:
-
-- the correct QCar actor number is selected;
-- the QCar exists;
-- QLabs is responsive;
-- another application is not continuously taking over the possessed QLabs camera.
-
-A failure to possess the front camera causes the synchronized recording startup to fail rather than silently recording the wrong main view.
-
----
-
-## 23. Left/Right/Rear camera shows `ERROR`
-
-Try:
-
-1. stopping the current test session;
-2. reducing **Requested FPS** from `15` to `10`;
-3. disabling one or more optional cameras;
-4. verifying QLabs remains responsive.
-
-The side/rear camera recordings are optional; telemetry + the OBS front recording are the primary experiment data.
-
----
-
-## 24. Telemetry has dropped samples
-
-Occasional dropped samples are counted rather than hidden.
-
-If the count becomes large:
-
-- reduce optional camera load;
-- close unnecessary applications;
-- verify QLabs performance;
-- keep telemetry at 20 Hz unless you have a specific reason to increase it.
-
----
-
-## 25. Replay says the OBS video is missing
-
-The original OBS file may have been moved after the session was recorded.
-
-Try one of these:
-
-- restore the video to its original OBS output path;
-- copy it into the session folder with its original filename;
-- use **Load Manual Video...** in the replay window.
-
----
-
-## 26. Video does not play in the Qt video window
-
-The replay application uses Qt Multimedia, so playback depends on codecs available on the operating system.
-
-If a video file cannot be played, use a common OBS recording codec/container that Windows/Qt supports well. MP4 is generally the simplest choice for this project.
-
----
-
-## 27. Open Road map reference cannot be loaded
-
-Make sure the `data` folder contains the six lane-reference files listed in
-Section 14. If any of those files are missing, the reviewer falls back to:
-
-```text
-data\open_road_reference.json
-```
-
-The fallback keeps old copies of the repository usable, but it only shows the
-legacy single-reference road visualization rather than the full six-lane map.
-
----
-
-# Part J — Command-line options
-
-## 28. Recorder output folder from the command line
-
-You can choose the default recording root before the GUI opens:
-
-```bat
-python run_recorder.py --output D:\QLabsExperiments\recordings
-```
-
-You can still change it in the GUI afterward.
-
----
-
-## 29. Open a replay session directly
-
-Instead of selecting a session after startup:
-
-```bat
-python run_replay.py --session "C:\path\to\recordings\2026-09-10_091530_participant_001_run_01"
-```
-
-You can also provide a specific Open Road reference file:
-
-```bat
-python run_replay.py --session "C:\path\to\session" --reference "C:\path\to\open_road_reference.json"
-```
-
----
-
-# Part K — Synchronization design
-
-## 30. Why the recorder starts OBS first
-
-The project does not assume that sending an OBS `StartRecord` command means that the first encoded video frame exists at that exact instant.
-
-The recorder instead:
-
-1. requests OBS recording start;
-2. waits until OBS reports that recording is active;
-3. reads OBS's current output duration;
-4. estimates the monotonic-clock instant corresponding to video `t = 0`;
-5. uses that as the common session timeline;
-6. periodically records OBS/session clock correlation into `obs_sync.csv`.
-
-Telemetry and additional camera timestamps are saved on that same session timeline.
-
-This is why manually starting OBS before **START SESSION** is not supported.
-
----
-
-# Part L — Current project structure
+The video window interpolates these mappings, so OBS and QLabs CSI recordings
+can stay aligned to the same replay timeline even if capture starts slightly
+later or the clocks drift slightly over a long experiment.
+
+## Project layout
 
 ```text
 QLabs_Drive_Replay/
 ├── apps/
-│   ├── location_recorder.py       # one-button recorder GUI
-│   └── open_road_replay.py        # map/timeline replay GUI
+│   ├── location_recorder.py
+│   └── open_road_replay.py
 ├── core/
 │   ├── oop_interfaces.py
-│   ├── recorder_core.py           # synchronized session recorder
+│   ├── recorder_core.py
 │   ├── replay_clock.py
 │   ├── replay_controller.py
 │   └── replay_core.py
 ├── integrations/
-│   ├── location_sources.py        # QLabs QCar world-transform source
-│   ├── recording_services.py      # OBS + additional CSI recording
+│   ├── location_sources.py
+│   ├── recording_services.py
 │   ├── replay_sinks.py
-│   └── qlabs_replay.py            # dormant/future; not exposed in UI
+│   └── qlabs_replay.py          # dormant/future, not shown in current UI
 ├── ui/
-│   └── replay_video_window.py      # separate synchronized video window
+│   └── replay_video_window.py
 ├── data/
-│   ├── open_road_reference.json
+│   ├── open_road_reference.json                 # legacy/fallback reference
 │   ├── open_road_reference_upper_right_lane.json
 │   ├── open_road_reference_upper_middle_lane.json
 │   ├── open_road_reference_upper_left_lane.json
 │   ├── open_road_reference_lower_right_lane.json
 │   ├── open_road_reference_lower_middle_lane.json
 │   └── open_road_reference_lower_left_lane.json
-├── recordings/
-├── run_recorder.py
-├── run_replay.py
-├── run_recorder.bat
-├── run_replay.bat
-└── requirements.txt
+└── recordings/
 ```
 
----
+## Requirements
 
-# Quick start checklist
+- Python 3.10+
+- PySide6
+- Quanser QLabs Python `qvl` package
+- OBS Studio with OBS WebSocket enabled
+- `obsws-python`
+- OpenCV + NumPy for optional left/right/rear video capture
 
-For normal experiment days, after the first-time setup is complete, the workflow is simply:
+Install the pip dependencies with:
 
-```text
-1. Start QLabs
-2. Load Open Road and the correct QCar actor
-3. Start OBS and select the QLabs capture scene
-4. Make sure OBS is NOT already recording
-5. Run run_recorder.bat
-6. Enter/check actor number and session label
-7. Press START SESSION once
-8. Wait for SESSION RECORDING / OBS: RECORDING
-9. Perform the drive
-10. Press STOP SESSION once
-11. Wait for Session complete
-12. Run run_replay.bat
-13. Load the session folder
-14. Review map + synchronized video
+```bash
+pip install -r requirements.txt
 ```
 
-The goal is that **you never have to manually press OBS Record during an experiment**.
+## Recommended first validation
+
+Do a 1–2 minute test before a full experiment. Drive past a recognizable point,
+stop the session, open it in the reviewer, click that point, then switch between
+Front/Left/Right/Rear in the video window and check that the same moment is
+shown across the available recordings.
 
 
 ## Camera preflight and Replay-side start alignment
@@ -1002,3 +199,24 @@ Left/Right/Rear are recorded by one sequential multi-camera worker using one ded
 The default detector uses a **0.30 m/s rolling speed threshold**, **1.5 s sustained movement**, a **0.50 s speed averaging window**, and **0.30 m minimum displacement from the initial position**. These values are editable in the configuration window. Detection is only a suggestion; it is never applied until you choose **Apply to selected recording**.
 
 The **Use configured starts** checkbox applies the selected offset for each driver so their chosen launch becomes replay `00:00.000`. Uncheck it at any time to inspect every raw recording from its original start. OBS/CSI MP4 files and telemetry CSVs are never edited or cut.
+
+## Start-position normalization and 50 km straight analysis
+
+Replay now has an optional **Align map start X** display normalization. Enter a target X coordinate (default `-0.084 m`) and every loaded trajectory is shifted only in X so its Replay `00:00` sample begins at that X. The recorded Y coordinate is preserved, so drivers starting in different lanes remain in their real lane. This affects only the map display and map-click coordinate lookup; raw telemetry and video are unchanged.
+
+For driver-comparison work, click **50 km Straight Analysis…**. This window projects each recorded XY sample onto the reconstructed Open Road median route and expresses the sample as:
+
+- route station/progress along the lap;
+- signed lateral position across the road (approximately `+10/+6/+2/-2/-6/-10 m` at the six lane centers);
+- nearest lane center and lateral lane-center error.
+
+The curved Open Road lap is then unwrapped onto a fixed **0–50 km horizontal axis**. The six lane centers, lane dividers, road edges, and median stay horizontal, so gradual drift toward a neighboring lane is easy to see. Multiple recordings are drawn together using the same colors as the replay map, and the current replay time is shown with synchronized markers.
+
+Leave **Start each recording at 0 km** enabled for the recommended comparison mode. It makes the selected Replay start for every driver the 0 km origin, independent of small differences in the raw world-space starting X. This is separate from the optional top-down map X shift.
+
+The analysis window can export:
+
+- **PNG** — the current straightened six-lane comparison plot;
+- **CSV** — all loaded recordings with `replay_time_s`, raw world XYZ, route station, route progress, normalized 0–50 km distance, lateral position, nearest lane, lane-center position, and lane-center error.
+
+These analysis operations are non-destructive. No MP4, telemetry CSV, or CSI timestamp file is rewritten.
