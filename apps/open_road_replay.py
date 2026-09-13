@@ -16,8 +16,9 @@ import csv
 import math
 from pathlib import Path
 import sys
+import time
 
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QCursor, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -142,6 +143,15 @@ class ReplayMap(QWidget):
         self._pan_active = False
         self._pan_last = QPointF()
 
+        # The road geometry and complete trajectories are static while replay
+        # time advances. Rendering those thousands of points at 60 Hz was the
+        # main source of UI slowdown, especially with several recordings
+        # loaded. Cache that layer and redraw only the moving car markers.
+        self._static_cache: QImage | None = None
+
+    def _invalidate_static_cache(self) -> None:
+        self._static_cache = None
+
     def set_session(self, session: SessionData | None) -> None:
         """Set the active replay without clearing comparison trajectories."""
         self.session = session
@@ -152,6 +162,7 @@ class ReplayMap(QWidget):
             self.session_display = []
         else:
             self.session_display = rdp_simplify(session.xyz_points(), tolerance_m=1.0)
+        self._invalidate_static_cache()
         self.update()
 
     def set_session_overlays(self, entries: list[dict], active_key: str | None) -> None:
@@ -178,6 +189,7 @@ class ReplayMap(QWidget):
         self.session_overlays = overlays
         self.active_session_key = active_key
         self.comparison_poses = {}
+        self._invalidate_static_cache()
         self.update()
 
     def set_comparison_time(self, time_s: float) -> None:
@@ -203,6 +215,7 @@ class ReplayMap(QWidget):
         self.center_x = self.data_center_x
         self.center_y = self.data_center_y
         self.zoom = 1.0
+        self._invalidate_static_cache()
         self.update()
 
     def fit_scale(self) -> float:
@@ -344,18 +357,29 @@ class ReplayMap(QWidget):
         painter.setPen(reference_pen)
         painter.drawPath(self._make_path(self.reference_display))
 
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
+    def _render_static_cache(self) -> None:
+        """Render road geometry, full trajectories, axes, and legends once.
+
+        Replay-time updates only move car markers, so rebuilding the full road
+        and every trajectory on each clock tick is unnecessary. The cache is
+        invalidated when the view, loaded recordings, or active recording
+        changes.
+        """
+        if self.width() <= 0 or self.height() <= 0:
+            self._static_cache = None
+            return
+        image = QImage(
+            self.width(), self.height(), QImage.Format.Format_ARGB32_Premultiplied
+        )
+        image.fill(QColor(31, 35, 41))
+        painter = QPainter(image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor(31, 35, 41))
 
         if self.lane_geometry is not None:
             self._draw_six_lane_reference(painter)
         else:
             self._draw_legacy_reference(painter)
 
-        # Every loaded recording gets a persistent color. The active recording
-        # is drawn last and thicker because it controls the video/timeline.
         overlay_items = list(self.session_overlays.items())
         overlay_items.sort(key=lambda item: item[0] == self.active_session_key)
         for key, entry in overlay_items:
@@ -365,7 +389,9 @@ class ReplayMap(QWidget):
             session_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             session_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(session_pen)
-            painter.drawPath(self._make_path(entry["display"], float(entry.get("x_shift", 0.0))))
+            painter.drawPath(
+                self._make_path(entry["display"], float(entry.get("x_shift", 0.0)))
+            )
 
         if not self.session_overlays and self.session_display:
             session_pen = QPen(QColor(52, 183, 245), 3.0)
@@ -379,6 +405,65 @@ class ReplayMap(QWidget):
         painter.setPen(axis_pen)
         painter.drawLine(QPointF(origin.x(), 0), QPointF(origin.x(), self.height()))
         painter.drawLine(QPointF(0, origin.y()), QPointF(self.width(), origin.y()))
+
+        if self.session_overlays:
+            legend_x = max(12, self.width() - 300)
+            legend_y = 22
+            max_rows = 10
+            for row, (key, entry) in enumerate(list(self.session_overlays.items())[:max_rows]):
+                color = QColor(*entry["color"])
+                line_pen = QPen(color, 3.0 if key == self.active_session_key else 2.0)
+                line_pen.setCosmetic(True)
+                painter.setPen(line_pen)
+                painter.drawLine(
+                    legend_x,
+                    legend_y + row * 18 - 5,
+                    legend_x + 24,
+                    legend_y + row * 18 - 5,
+                )
+                painter.setPen(QColor(230, 234, 238))
+                label = entry["label"]
+                if len(label) > 26:
+                    label = label[:23] + "…"
+                prefix = "ACTIVE — " if key == self.active_session_key else ""
+                painter.drawText(legend_x + 31, legend_y + row * 18, prefix + label)
+            if len(self.session_overlays) > max_rows:
+                painter.setPen(QColor(184, 192, 201))
+                painter.drawText(
+                    legend_x + 31,
+                    legend_y + max_rows * 18,
+                    f"+{len(self.session_overlays) - max_rows} more",
+                )
+
+        painter.setPen(QColor(184, 192, 201))
+        if self.lane_geometry is not None:
+            legend = (
+                "White: road/lane markings   Faint dotted: six measured lane centers   "
+                "Colored: loaded recordings (thicker = active)   |   "
+                "Left click any route: seek/switch   Wheel: zoom   Middle/right drag: pan"
+            )
+        else:
+            legend = (
+                "Blue: recorded session   Yellow dotted: legacy Open Road reference   |   "
+                "Left click route: seek   Wheel: zoom   Middle/right drag: pan"
+            )
+        painter.drawText(12, self.height() - 12, legend)
+        painter.end()
+        self._static_cache = image
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        if (
+            self._static_cache is None
+            or self._static_cache.width() != self.width()
+            or self._static_cache.height() != self.height()
+        ):
+            self._render_static_cache()
+        if self._static_cache is not None:
+            painter.drawImage(0, 0, self._static_cache)
+        else:
+            painter.fillRect(self.rect(), QColor(31, 35, 41))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         marker_poses = dict(self.comparison_poses)
         if self.current_pose is not None and self.active_session_key is not None:
@@ -438,45 +523,6 @@ class ReplayMap(QWidget):
                 f"Cursor X {self.hover_world[0]:.1f} m   Y {self.hover_world[1]:.1f} m",
             )
 
-        # Compact recording/color legend. This stays visible even when current
-        # car markers overlap on the same lane.
-        if self.session_overlays:
-            legend_x = max(12, self.width() - 300)
-            legend_y = 22
-            max_rows = 10
-            for row, (key, entry) in enumerate(list(self.session_overlays.items())[:max_rows]):
-                color = QColor(*entry["color"])
-                line_pen = QPen(color, 3.0 if key == self.active_session_key else 2.0)
-                line_pen.setCosmetic(True)
-                painter.setPen(line_pen)
-                painter.drawLine(legend_x, legend_y + row * 18 - 5, legend_x + 24, legend_y + row * 18 - 5)
-                painter.setPen(QColor(230, 234, 238))
-                label = entry["label"]
-                if len(label) > 26:
-                    label = label[:23] + "…"
-                prefix = "ACTIVE — " if key == self.active_session_key else ""
-                painter.drawText(legend_x + 31, legend_y + row * 18, prefix + label)
-            if len(self.session_overlays) > max_rows:
-                painter.setPen(QColor(184, 192, 201))
-                painter.drawText(
-                    legend_x + 31,
-                    legend_y + max_rows * 18,
-                    f"+{len(self.session_overlays) - max_rows} more",
-                )
-
-        painter.setPen(QColor(184, 192, 201))
-        if self.lane_geometry is not None:
-            legend = (
-                "White: road/lane markings   Faint dotted: six measured lane centers   "
-                "Colored: loaded recordings (thicker = active)   |   "
-                "Left click any route: seek/switch   Wheel: zoom   Middle/right drag: pan"
-            )
-        else:
-            legend = (
-                "Blue: recorded session   Yellow dotted: legacy Open Road reference   |   "
-                "Left click route: seek   Wheel: zoom   Middle/right drag: pan"
-            )
-        painter.drawText(12, self.height() - 12, legend)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         pos = event.position()
@@ -487,6 +533,7 @@ class ReplayMap(QWidget):
             self.center_x -= delta.x() / scale
             self.center_y += delta.y() / scale
             self._pan_last = pos
+            self._invalidate_static_cache()
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -514,7 +561,12 @@ class ReplayMap(QWidget):
         after_x, after_y = self.screen_to_world(mouse_pos)
         self.center_x += before_x - after_x
         self.center_y += before_y - after_y
+        self._invalidate_static_cache()
         self.update()
+
+    def resizeEvent(self, event) -> None:
+        self._invalidate_static_cache()
+        super().resizeEvent(event)
 
 
 class StartAlignmentDialog(QDialog):
@@ -855,25 +907,60 @@ class StraightRoadLiveView(QWidget):
         self.hover_road: tuple[float, float] | None = None
         self.last_clicked_road: tuple[float, float] | None = None
 
+        # Static 50 km road + full trajectories are cached. Only the moving
+        # replay markers are redrawn during playback.
+        self._static_cache: QImage | None = None
+
+        # The master clock ticks at ~60 Hz. The live analysis view is perfectly
+        # smooth at 30 Hz and halving its repaint rate avoids wasting CPU/GPU
+        # while video windows are also decoding frames.
+        self._max_live_fps = 30.0
+        self._last_live_repaint_wall = 0.0
+        self._pending_time_s: float | None = None
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setSingleShot(True)
+        self._repaint_timer.timeout.connect(self._flush_pending_time)
+
+    def _invalidate_static_cache(self) -> None:
+        self._static_cache = None
+
+    def _flush_pending_time(self) -> None:
+        if self._pending_time_s is None:
+            return
+        self.current_time_s = float(self._pending_time_s)
+        self._pending_time_s = None
+        if self.follow_active and self._follow_current_active():
+            self._invalidate_static_cache()
+        self._last_live_repaint_wall = time.perf_counter()
+        self.update()
+
     def set_entries(self, entries: list[dict]) -> None:
         self.entries = {str(entry["key"]): entry for entry in entries}
+        self._invalidate_static_cache()
         self.update()
 
     def set_follow_active(self, enabled: bool) -> None:
         self.follow_active = bool(enabled)
-        if self.follow_active:
-            self._follow_current_active()
+        if self.follow_active and self._follow_current_active():
+            self._invalidate_static_cache()
         self.update()
 
     def set_time(self, time_s: float) -> None:
-        self.current_time_s = float(time_s)
-        if self.follow_active:
-            self._follow_current_active()
-        self.update()
+        self._pending_time_s = float(time_s)
+        now = time.perf_counter()
+        minimum_interval = 1.0 / self._max_live_fps
+        elapsed = now - self._last_live_repaint_wall
+        if elapsed >= minimum_interval and not self._repaint_timer.isActive():
+            self._flush_pending_time()
+            return
+        if not self._repaint_timer.isActive():
+            delay_ms = max(1, int(math.ceil((minimum_interval - elapsed) * 1000.0)))
+            self._repaint_timer.start(delay_ms)
 
     def fit_all(self) -> None:
         self.view_span_km = 50.0
         self.view_center_km = 25.0
+        self._invalidate_static_cache()
         self.update()
 
     def set_view_span(self, span_km: float) -> None:
@@ -881,6 +968,7 @@ class StraightRoadLiveView(QWidget):
         self._clamp_view()
         if self.follow_active:
             self._follow_current_active()
+        self._invalidate_static_cache()
         self.update()
 
     def _active_entry(self) -> dict | None:
@@ -899,21 +987,23 @@ class StraightRoadLiveView(QWidget):
         index = max(0, min(len(samples) - 1, right - 1))
         return samples[index]
 
-    def _follow_current_active(self) -> None:
+    def _follow_current_active(self) -> bool:
         if self.view_span_km >= 49.999:
-            return
+            return False
         entry = self._active_entry()
         if entry is None:
-            return
+            return False
         sample = self._sample_at_time(entry, self.current_time_s)
         if sample is None:
-            return
+            return False
         margin = self.view_span_km * 0.22
         left, right = self._visible_range()
         x = float(sample.display_distance_km)
+        old_center = self.view_center_km
         if x < left + margin or x > right - margin:
             self.view_center_km = x
             self._clamp_view()
+        return abs(self.view_center_km - old_center) > 1e-9
 
     def _visible_range(self) -> tuple[float, float]:
         half = self.view_span_km / 2.0
@@ -1018,7 +1108,7 @@ class StraightRoadLiveView(QWidget):
             y = self.road_to_screen(view_left, lateral).y()
             painter.drawText(QPointF(left + 8.0, y - 5.0), label)
 
-    def _draw_trajectories(self, painter: QPainter) -> None:
+    def _draw_static_trajectories(self, painter: QPainter) -> None:
         view_left, view_right = self._visible_range()
         items = list(self.entries.values())
         items.sort(key=lambda entry: bool(entry.get("active")))
@@ -1051,6 +1141,11 @@ class StraightRoadLiveView(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawPath(path)
 
+    def _draw_live_markers(self, painter: QPainter) -> None:
+        view_left, view_right = self._visible_range()
+        items = list(self.entries.values())
+        items.sort(key=lambda entry: bool(entry.get("active")))
+
         marker_row = 0
         for entry in items:
             current = self._sample_at_time(entry, self.current_time_s)
@@ -1076,12 +1171,35 @@ class StraightRoadLiveView(QWidget):
             painter.drawText(p + QPointF(10.0, -10.0 - (marker_row % 2) * 11.0), prefix + label)
             marker_row += 1
 
+    def _render_static_cache(self) -> None:
+        if self.width() <= 0 or self.height() <= 0:
+            self._static_cache = None
+            return
+        image = QImage(
+            self.width(), self.height(), QImage.Format.Format_ARGB32_Premultiplied
+        )
+        image.fill(QColor(31, 35, 41))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self._draw_road(painter)
+        self._draw_static_trajectories(painter)
+        painter.end()
+        self._static_cache = image
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
+        if (
+            self._static_cache is None
+            or self._static_cache.width() != self.width()
+            or self._static_cache.height() != self.height()
+        ):
+            self._render_static_cache()
+        if self._static_cache is not None:
+            painter.drawImage(0, 0, self._static_cache)
+        else:
+            painter.fillRect(self.rect(), QColor(31, 35, 41))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor(31, 35, 41))
-        self._draw_road(painter)
-        self._draw_trajectories(painter)
+        self._draw_live_markers(painter)
 
         painter.setPen(QColor(228, 233, 238))
         view_left, view_right = self._visible_range()
@@ -1107,6 +1225,7 @@ class StraightRoadLiveView(QWidget):
             self.view_center_km -= delta.x() / max(1.0, width) * self.view_span_km
             self._clamp_view()
             self._pan_last = pos
+            self._invalidate_static_cache()
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -1139,10 +1258,15 @@ class StraightRoadLiveView(QWidget):
         self.view_span_km = new_span
         self.view_center_km = before_km - (fraction - 0.5) * new_span
         self._clamp_view()
+        self._invalidate_static_cache()
         self.update()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         self.fit_all()
+
+    def resizeEvent(self, event) -> None:
+        self._invalidate_static_cache()
+        super().resizeEvent(event)
 
 
 class StraightRoadExportPlot(QWidget):
@@ -1354,7 +1478,10 @@ class StraightRoadAnalysisWindow(QMainWindow):
                         session,
                         normalize_start=normalize,
                         display_length_m=50_000.0,
-                        max_points=7000,
+                        # Live rendering does not need every 20 Hz telemetry
+                        # sample. Keep a high-quality 5k-point representation;
+                        # CSV export below still uses the full-resolution data.
+                        max_points=5000,
                     )
                     self._plot_cache[cache_key] = samples
                 entries.append({

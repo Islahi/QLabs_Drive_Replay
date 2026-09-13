@@ -214,6 +214,8 @@ The curved Open Road lap is then unwrapped into a fixed **0–50 km live road vi
 
 The chart-style 0–50 km plot is **not shown during normal replay**. It is generated only when you click **Export Plot PNG…**.
 
+Performance note: the normal Open Road map and the live 50 km view cache the static road/trajectory layers and redraw only moving car markers during playback. The 50 km live view is capped at 30 FPS and uses a 5,000-point display representation per recording; CSV export still uses the full telemetry resolution. This keeps multi-session replay responsive without changing the recorded data or exported analysis values.
+
 Leave **Start each recording at 0 km** enabled for the recommended comparison mode. It makes the selected Replay start for every driver the 0 km origin, independent of small differences in the raw world-space starting X. This is separate from the optional top-down map X shift.
 
 The analysis window can export:
