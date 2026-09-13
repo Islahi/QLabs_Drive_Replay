@@ -577,7 +577,6 @@ class ReplayWindow(QMainWindow):
         self.clear_sessions_button.clicked.connect(self.clear_sessions)
         top.addWidget(self.clear_sessions_button)
 
-<<<<<<< HEAD
         self.apply_trim_check = QCheckBox("Align driving starts")
         self.apply_trim_check.setChecked(True)
         self.apply_trim_check.setToolTip(
@@ -587,8 +586,6 @@ class ReplayWindow(QMainWindow):
         self.apply_trim_check.toggled.connect(self.on_alignment_mode_changed)
         top.addWidget(self.apply_trim_check)
 
-=======
->>>>>>> 2bfea3aae85bdb3c31675e62667ce3948d6a0dad
         self.session_label = QLabel("0 recordings loaded")
         self.session_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         top.addWidget(self.session_label, 1)
@@ -729,143 +726,8 @@ class ReplayWindow(QMainWindow):
                 self, "No sessions found",
                 f"No session.json files were found below:\n{root_path}",
             )
-<<<<<<< HEAD
-=======
             return
 
-        loaded = 0
-        first_new_key: str | None = None
-        for folder in candidates:
-            key = str(folder.resolve())
-            if key in self.loaded_sessions:
-                continue
-            if self.add_session(folder, make_active=False, show_errors=False):
-                loaded += 1
-                if first_new_key is None:
-                    first_new_key = key
-
-        if self.active_session_key is None and first_new_key is not None:
-            self.set_active_session(first_new_key, preserve_time=False)
-        else:
-            self._refresh_session_ui()
-        self.status_label.setText(
-            f"Loaded {loaded} new recording(s) from {root_path}. "
-            f"{len(self.loaded_sessions)} total trajectories visible."
-        )
-
-    def _unique_session_label(self, session: SessionData) -> str:
-        base = session.folder.name or "recording"
-        used = set(self.session_labels.values())
-        if base not in used:
-            return base
-        counter = 2
-        while f"{base} ({counter})" in used:
-            counter += 1
-        return f"{base} ({counter})"
-
-    def _session_overlay_entries(self) -> list[dict]:
-        entries: list[dict] = []
-        for key in self.session_order:
-            session = self.loaded_sessions.get(key)
-            if session is None:
-                continue
-            entries.append({
-                "key": key,
-                "label": self.session_labels[key],
-                "session": session,
-                "color": self.session_colors[key],
-            })
-        return entries
-
-    def _refresh_session_ui(self) -> None:
-        self.active_session_combo.blockSignals(True)
-        self.active_session_combo.clear()
-        active_index = -1
-        for key in self.session_order:
-            if key not in self.loaded_sessions:
-                continue
-            label = self.session_labels[key]
-            color = self.session_colors[key]
-            self.active_session_combo.addItem(label, key)
-            item_index = self.active_session_combo.count() - 1
-            self.active_session_combo.setItemData(
-                item_index, QColor(*color), Qt.ItemDataRole.ForegroundRole
-            )
-            if key == self.active_session_key:
-                active_index = item_index
-        if active_index >= 0:
-            self.active_session_combo.setCurrentIndex(active_index)
-        self.active_session_combo.blockSignals(False)
-
-        self.map_widget.set_session_overlays(
-            self._session_overlay_entries(), self.active_session_key
-        )
-        self.map_widget.set_comparison_time(self.clock.current_time_s)
-
-        count = len(self.loaded_sessions)
-        if self.active_session_key in self.loaded_sessions:
-            active = self.loaded_sessions[self.active_session_key]
-            label = self.session_labels[self.active_session_key]
-            self.session_label.setText(
-                f"{count} recording(s) loaded — active: {label} — "
-                f"{active.sample_count:,} samples — {format_time_s(active.duration_s)}"
-            )
-        else:
-            self.session_label.setText(f"{count} recording(s) loaded")
-        self.remove_session_button.setEnabled(count > 0)
-        self.clear_sessions_button.setEnabled(count > 0)
-        self.active_session_combo.setEnabled(count > 0)
-
-    def add_session(
-        self, path: Path, make_active: bool = True, show_errors: bool = True
-    ) -> bool:
-        try:
-            session = SessionData.load(path)
-        except Exception as exc:
-            if show_errors:
-                QMessageBox.critical(self, "Could not load session", str(exc))
-            return False
-
-        key = str(session.folder.resolve())
-        if key not in self.loaded_sessions:
-            self.loaded_sessions[key] = session
-            self.session_order.append(key)
-            self.session_labels[key] = self._unique_session_label(session)
-            used_colors = set(self.session_colors.values())
-            available = [color for color in SESSION_COLORS if color not in used_colors]
-            if available:
-                self.session_colors[key] = available[0]
-            else:
-                palette_index = (len(self.session_order) - 1) % len(SESSION_COLORS)
-                self.session_colors[key] = SESSION_COLORS[palette_index]
-
-        if make_active or self.active_session_key is None:
-            self.set_active_session(
-                key, preserve_time=(self.active_session_key is not None)
-            )
-        else:
-            self._refresh_session_ui()
-            self._refresh_comparison_video_windows()
-        return True
-
-    def load_session(self, path: Path) -> None:
-        """Backward-compatible API: loading now adds rather than replaces."""
-        self.add_session(path, make_active=True)
-
-    def set_active_session(self, key: str, preserve_time: bool = True) -> None:
-        if key not in self.loaded_sessions:
->>>>>>> 2bfea3aae85bdb3c31675e62667ce3948d6a0dad
-            return
-        old_time = self.clock.current_time_s if preserve_time else 0.0
-        self.active_session_key = key
-        self.session = self.loaded_sessions[key]
-        # Populate/cached map overlays before the coordinator changes the active
-        # sink session, avoiding a second simplification of long telemetry.
-        self._refresh_session_ui()
-        self.coordinator.set_session(self.session)
-        self.clock.seek(min(old_time, self.session.duration_s) if preserve_time else 0.0)
-
-<<<<<<< HEAD
         loaded = 0
         first_new_key: str | None = None
         for folder in candidates:
@@ -1033,8 +895,6 @@ class ReplayWindow(QMainWindow):
         self.coordinator.set_session(self.session)
         self.clock.seek(min(old_time, self.session.duration_s) if preserve_time else 0.0)
 
-=======
->>>>>>> 2bfea3aae85bdb3c31675e62667ce3948d6a0dad
         label = self.session_labels[key]
         self.video_window.setWindowTitle(f"Drive Replay Video — ACTIVE — {label}")
         self._refresh_comparison_video_windows()
