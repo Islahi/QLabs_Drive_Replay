@@ -1,0 +1,68 @@
+{
+  "format": "qlabs_drive_session",
+  "version": 2,
+  "workspace": "Open Road",
+  "session_id": "2026-09-10_195558_lower_left_lane",
+  "status": "complete",
+  "created_utc": "2026-09-10T16:55:58.302562+00:00",
+  "recording_started_utc": "2026-09-10T16:55:58.881160+00:00",
+  "finished_utc": "2026-09-10T18:02:40.788455+00:00",
+  "timebase": {
+    "kind": "obs_aligned_monotonic_seconds",
+    "column": "time_s",
+    "description": "Seconds from the estimated first OBS-recorded video frame. Telemetry may begin slightly after t=0 while startup completes.",
+    "obs_duration_at_first_status_s": 0.0
+  },
+  "source": {
+    "kind": "qlabs_qcar2_world_transform",
+    "host": "localhost",
+    "actor_number": 0
+  },
+  "telemetry": {
+    "file": "location.csv",
+    "columns": [
+      "time_s",
+      "scheduled_time_s",
+      "x",
+      "y",
+      "z",
+      "roll_rad",
+      "pitch_rad",
+      "yaw_rad",
+      "valid"
+    ],
+    "requested_sample_rate_hz": 20.0,
+    "sample_count": 80038,
+    "dropped_samples": 0,
+    "duration_s": 4001.906896
+  },
+  "videos": {
+    "qlabs_front": {
+      "kind": "obs_qlabs_window",
+      "label": "QLabs Front (OBS)",
+      "path": "C:/Users/admin/Videos/2026-09-10 19-55-58.mp4",
+      "sync_file": "obs_sync.csv",
+      "preferred": true
+    }
+  },
+  "replay": {
+    "heading_source": "derived_from_consecutive_xy_samples"
+  },
+  "qlabs": {
+    "host": "localhost",
+    "source_actor_number": 0
+  },
+  "recorder": {
+    "kind": "one_button_obs_qlabs",
+    "qlabs_front_view": true,
+    "additional_cameras": [],
+    "additional_camera_fps": 15.0
+  },
+  "obs": {
+    "host": "localhost",
+    "port": 4455,
+    "sync_file": "obs_sync.csv",
+    "recording_path": "C:/Users/admin/Videos/2026-09-10 19-55-58.mp4",
+    "sync_samples": 3971
+  }
+}
