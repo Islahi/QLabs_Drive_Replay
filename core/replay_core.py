@@ -106,37 +106,68 @@ def detect_sustained_motion_start(
     threshold_mps: float = 0.30,
     required_motion_s: float = 1.5,
     speed_window_s: float = 0.50,
+    min_displacement_m: float = 0.30,
+    dropout_tolerance_s: float = 0.25,
 ) -> float | None:
-    """Return the first sustained-driving time from timestamped XY samples.
+    """Return the first robust, sustained vehicle-motion time.
 
-    The detector intentionally does not trigger on one noisy position jump: the
-    instantaneous XY speed must stay above ``threshold_mps`` for
-    ``required_motion_s``.  ``speed_window_s`` is retained in the session
-    metadata/API for compatibility and future smoothing, while sustained-time
-    validation provides the primary jitter rejection.
+    Speed is estimated over a rolling XY window rather than from adjacent
+    samples.  The vehicle must also move a minimum distance away from its
+    initial position, which rejects spawn jitter and tiny coordinate noise.
+    Brief sub-threshold samples are tolerated so one noisy telemetry point does
+    not reset an otherwise continuous launch.
     """
     if not (len(times) == len(xs) == len(ys)) or len(times) < 2:
         return None
+
     threshold = max(0.0, float(threshold_mps))
     required = max(0.0, float(required_motion_s))
+    window = max(0.05, float(speed_window_s))
+    min_displacement = max(0.0, float(min_displacement_m))
+    dropout_tolerance = max(0.0, float(dropout_tolerance_s))
+
+    t_values = [float(v) for v in times]
+    x_values = [float(v) for v in xs]
+    y_values = [float(v) for v in ys]
+    start_x = x_values[0]
+    start_y = y_values[0]
+
+    j = 0
     run_start: float | None = None
-    for i in range(1, len(times)):
-        t0 = float(times[i - 1])
-        t1 = float(times[i])
-        dt = t1 - t0
+    last_moving_t: float | None = None
+
+    for i in range(1, len(t_values)):
+        t = t_values[i]
+        while j + 1 < i and t_values[j + 1] <= t - window:
+            j += 1
+        dt = t - t_values[j]
         if dt <= 0:
             continue
-        speed = math.hypot(
-            float(xs[i]) - float(xs[i - 1]),
-            float(ys[i]) - float(ys[i - 1]),
+
+        rolling_speed = math.hypot(
+            x_values[i] - x_values[j],
+            y_values[i] - y_values[j],
         ) / dt
-        if speed >= threshold:
+        displacement = math.hypot(
+            x_values[i] - start_x,
+            y_values[i] - start_y,
+        )
+        moving = rolling_speed >= threshold and displacement >= min_displacement
+
+        if moving:
             if run_start is None:
-                run_start = t0
-            if t1 - run_start >= required:
+                # Back-date by half the averaging window. This compensates for
+                # rolling-speed latency without jumping all the way back into
+                # the stationary portion.
+                run_start = max(t_values[0], t - 0.5 * window)
+            last_moving_t = t
+            if t - run_start >= required:
                 return run_start
-        else:
-            run_start = None
+        elif run_start is not None:
+            if last_moving_t is None or t - last_moving_t > dropout_tolerance:
+                run_start = None
+                last_moving_t = None
+
     return None
 
 
@@ -383,6 +414,41 @@ class SessionData:
     @property
     def duration_s(self) -> float:
         return float(self.times[-1]) if self.times else 0.0
+
+    def with_analysis_start(self, start_s: float) -> "SessionData":
+        """Return a non-destructively time-shifted replay view of this session.
+
+        This method never edits session.json, telemetry CSVs, or videos.  It is
+        intended for Replay-side start alignment.  Call it on a raw SessionData
+        loaded with ``apply_analysis_trim=False``.
+        """
+        start = max(0.0, min(float(start_s), self.raw_duration_s))
+        if start <= 1e-9:
+            if self.analysis_start_s <= 1e-9:
+                return self
+            raise ValueError("with_analysis_start() must be called on a raw session view.")
+        if self.analysis_start_s > 1e-9:
+            raise ValueError("with_analysis_start() must be called on a raw session view.")
+
+        first_index = 0
+        while first_index < len(self.times) and self.times[first_index] < start:
+            first_index += 1
+        if first_index >= len(self.times):
+            first_index = len(self.times) - 1
+
+        shifted_times = [max(0.0, t - start) for t in self.times[first_index:]]
+        recorded_yaws = list(self.yaws[first_index:])
+        return SessionData(
+            self.folder,
+            self.metadata,
+            shifted_times,
+            list(self.xs[first_index:]),
+            list(self.ys[first_index:]),
+            list(self.zs[first_index:]),
+            recorded_yaws=recorded_yaws,
+            analysis_start_s=start,
+            raw_duration_s=self.raw_duration_s,
+        )
 
     def _derive_yaws(self) -> list[float]:
         count = len(self.times)

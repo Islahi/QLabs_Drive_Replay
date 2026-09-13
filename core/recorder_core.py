@@ -12,7 +12,7 @@ import threading
 import time
 
 from core.oop_interfaces import LocationSource
-from core.replay_core import detect_sustained_motion_start, new_session_document, utc_now_iso, write_json_atomic
+from core.replay_core import new_session_document, utc_now_iso, write_json_atomic
 
 
 class RecorderWorker:
@@ -174,35 +174,6 @@ class RecorderWorker:
             write_json_atomic(self.session_dir / "session.json", self.document)
 
 
-def _detect_motion_start_from_csv(
-    csv_path: Path,
-    threshold_mps: float,
-    required_motion_s: float,
-) -> float | None:
-    times: list[float] = []
-    xs: list[float] = []
-    ys: list[float] = []
-    if not Path(csv_path).is_file():
-        return None
-    with Path(csv_path).open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            try:
-                t = float(row["time_s"])
-                x = float(row["x"])
-                y = float(row["y"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            times.append(t)
-            xs.append(x)
-            ys.append(y)
-    return detect_sustained_motion_start(
-        times, xs, ys,
-        threshold_mps=threshold_mps,
-        required_motion_s=required_motion_s,
-        speed_window_s=0.50,
-    )
-
 
 class SessionRecorderWorker:
     """One-button synchronized recorder for telemetry + OBS + QLabs CSI cameras.
@@ -222,10 +193,6 @@ class SessionRecorderWorker:
         obs_password: str = "",
         camera_keys: tuple[str, ...] = ("left", "right", "rear"),
         camera_fps: float = 15.0,
-        auto_trim_stationary_start: bool = True,
-        motion_threshold_mps: float = 0.30,
-        required_motion_s: float = 1.5,
-        pre_roll_s: float = 0.0,
     ) -> None:
         from integrations.recording_services import OBSRecordingController
 
@@ -237,10 +204,6 @@ class SessionRecorderWorker:
         self.sample_period_s = 1.0 / self.sample_rate_hz
         self.camera_keys = tuple(dict.fromkeys(camera_keys))
         self.camera_fps = float(camera_fps)
-        self.auto_trim_stationary_start = bool(auto_trim_stationary_start)
-        self.motion_threshold_mps = max(0.0, float(motion_threshold_mps))
-        self.required_motion_s = max(0.0, float(required_motion_s))
-        self.pre_roll_s = max(0.0, float(pre_roll_s))
 
         self.obs = OBSRecordingController(
             host=obs_host,
@@ -279,17 +242,6 @@ class SessionRecorderWorker:
             "additional_cameras": list(self.camera_keys),
             "additional_camera_fps": self.camera_fps,
             "camera_capture_mode": "single_connection_sequential",
-        }
-        self.document["analysis"] = {
-            "auto_trim_stationary_start": self.auto_trim_stationary_start,
-            "non_destructive": True,
-            "motion_threshold_mps": self.motion_threshold_mps,
-            "required_motion_s": self.required_motion_s,
-            "speed_window_s": 0.50,
-            "pre_roll_s": self.pre_roll_s,
-            "detected_motion_start_s": None,
-            "analysis_start_s": 0.0,
-            "status": "pending" if self.auto_trim_stationary_start else "disabled",
         }
         self.document["obs"] = {
             "host": obs_host,
@@ -356,7 +308,6 @@ class SessionRecorderWorker:
                 "cameras": camera_states,
                 "camera_preflight": dict(self.camera_preflight),
                 "warnings": list(self.warnings),
-                "analysis": dict(self.document.get("analysis", {})),
             }
 
     def _run(self) -> None:
@@ -594,37 +545,6 @@ class SessionRecorderWorker:
                         self.warnings.append(
                             f"{metadata.get('label', key)}: {metadata.get('error') or 'recording failed'}"
                         )
-
-            # Non-destructive setup-wait removal: only metadata/replay origin is
-            # changed. location.csv and every video file stay byte-for-byte raw.
-            analysis = self.document.get("analysis", {})
-            if self.auto_trim_stationary_start and csv_path.is_file():
-                try:
-                    motion_start = _detect_motion_start_from_csv(
-                        csv_path,
-                        threshold_mps=self.motion_threshold_mps,
-                        required_motion_s=self.required_motion_s,
-                    )
-                    if motion_start is None:
-                        analysis["status"] = "no_sustained_motion_detected"
-                        analysis["analysis_start_s"] = 0.0
-                        self.warnings.append(
-                            "Automatic replay start alignment was enabled, but no sustained motion was detected."
-                        )
-                    else:
-                        analysis["detected_motion_start_s"] = round(float(motion_start), 6)
-                        analysis_start = max(0.0, float(motion_start) - self.pre_roll_s)
-                        analysis["analysis_start_s"] = round(analysis_start, 6)
-                        analysis["status"] = "detected"
-                except Exception as exc:
-                    analysis["status"] = "error"
-                    analysis["analysis_start_s"] = 0.0
-                    analysis["error"] = str(exc)
-                    self.warnings.append(f"Replay start alignment failed: {exc}")
-            elif not self.auto_trim_stationary_start:
-                analysis["status"] = "disabled"
-                analysis["analysis_start_s"] = 0.0
-            self.document["analysis"] = analysis
 
             # A camera failure is visible in session status even if telemetry/OBS
             # completed, avoiding the previous misleading status='complete'.

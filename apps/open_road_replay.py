@@ -21,8 +21,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -30,6 +33,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -39,6 +43,7 @@ from core.replay_core import (
     OpenRoadLaneGeometry,
     PassCandidate,
     SessionData,
+    detect_sustained_motion_start,
     extract_stable_completed_loop,
     find_open_road_reference,
     format_time_s,
@@ -46,6 +51,7 @@ from core.replay_core import (
     load_open_road_six_lane_geometry,
     offset_polyline_xy,
     rdp_simplify,
+    write_json_atomic,
 )
 from core.replay_clock import ReplayClock
 from core.replay_controller import ReplayCoordinator
@@ -505,6 +511,315 @@ class ReplayMap(QWidget):
         self.update()
 
 
+class StartAlignmentDialog(QDialog):
+    """Replay-side, non-destructive start alignment editor.
+
+    Detection is only a suggestion. The user can accept the detected launch,
+    type an arbitrary raw-session start time, or keep the complete raw start.
+    """
+
+    DEFAULT_SETTINGS = {
+        "threshold_mps": 0.30,
+        "required_motion_s": 1.5,
+        "speed_window_s": 0.50,
+        "min_displacement_m": 0.30,
+    }
+
+    def __init__(self, owner) -> None:
+        super().__init__(owner)
+        self.owner = owner
+        self.setWindowTitle("Configure Replay Start Alignment")
+        self.resize(620, 500)
+
+        layout = QVBoxLayout(self)
+
+        session_row = QHBoxLayout()
+        session_row.addWidget(QLabel("Recording:"))
+        self.session_combo = QComboBox()
+        for key in owner.session_order:
+            if key in owner.raw_sessions:
+                self.session_combo.addItem(owner.session_labels.get(key, Path(key).name), key)
+        self.session_combo.currentIndexChanged.connect(self._load_selected)
+        session_row.addWidget(self.session_combo, 1)
+        layout.addLayout(session_row)
+
+        detector_group = QGroupBox("Movement detector (suggestion only)")
+        detector_form = QFormLayout(detector_group)
+        layout.addWidget(detector_group)
+
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setRange(0.02, 10.0)
+        self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setSingleStep(0.05)
+        self.threshold_spin.setSuffix(" m/s")
+        detector_form.addRow("Rolling speed threshold", self.threshold_spin)
+
+        self.required_spin = QDoubleSpinBox()
+        self.required_spin.setRange(0.1, 10.0)
+        self.required_spin.setDecimals(1)
+        self.required_spin.setSingleStep(0.1)
+        self.required_spin.setSuffix(" s")
+        detector_form.addRow("Sustained movement", self.required_spin)
+
+        self.window_spin = QDoubleSpinBox()
+        self.window_spin.setRange(0.05, 3.0)
+        self.window_spin.setDecimals(2)
+        self.window_spin.setSingleStep(0.05)
+        self.window_spin.setSuffix(" s")
+        detector_form.addRow("Speed averaging window", self.window_spin)
+
+        self.displacement_spin = QDoubleSpinBox()
+        self.displacement_spin.setRange(0.0, 10.0)
+        self.displacement_spin.setDecimals(2)
+        self.displacement_spin.setSingleStep(0.05)
+        self.displacement_spin.setSuffix(" m")
+        detector_form.addRow("Minimum distance from start", self.displacement_spin)
+
+        detect_row = QHBoxLayout()
+        self.detect_button = QPushButton("Detect selected")
+        self.detect_button.clicked.connect(self.detect_selected)
+        detect_row.addWidget(self.detect_button)
+        self.detect_all_button = QPushButton("Detect all loaded recordings")
+        self.detect_all_button.clicked.connect(self.detect_all)
+        detect_row.addWidget(self.detect_all_button)
+        detect_row.addStretch(1)
+        detector_form.addRow(detect_row)
+
+        self.detected_label = QLabel("Detected movement: not calculated")
+        self.detected_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detector_form.addRow(self.detected_label)
+        self.detected_position_label = QLabel("Detected position: —")
+        self.detected_position_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detector_form.addRow(self.detected_position_label)
+
+        choice_group = QGroupBox("Replay 00:00 choice")
+        choice_form = QFormLayout(choice_group)
+        layout.addWidget(choice_group)
+
+        self.detected_radio = QRadioButton("Use detected movement start")
+        self.detected_radio.toggled.connect(self._update_manual_enabled)
+        choice_form.addRow(self.detected_radio)
+
+        manual_row = QHBoxLayout()
+        self.manual_radio = QRadioButton("Use manual raw time")
+        self.manual_radio.toggled.connect(self._update_manual_enabled)
+        manual_row.addWidget(self.manual_radio)
+        self.manual_spin = QDoubleSpinBox()
+        self.manual_spin.setRange(0.0, 100000.0)
+        self.manual_spin.setDecimals(3)
+        self.manual_spin.setSingleStep(0.1)
+        self.manual_spin.setSuffix(" s")
+        manual_row.addWidget(self.manual_spin, 1)
+        choice_form.addRow(manual_row)
+
+        self.raw_radio = QRadioButton("Use original recording start (no alignment)")
+        self.raw_radio.toggled.connect(self._update_manual_enabled)
+        choice_form.addRow(self.raw_radio)
+
+        self.chosen_label = QLabel("Replay 00:00 → raw 00:00:00.000")
+        self.chosen_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        choice_form.addRow("Current choice", self.chosen_label)
+
+        self.save_check = QCheckBox("Save this replay choice in session.json")
+        self.save_check.setChecked(True)
+        self.save_check.setToolTip(
+            "Only replay metadata is updated. MP4 files and telemetry CSVs are never edited or cut."
+        )
+        layout.addWidget(self.save_check)
+
+        note = QLabel(
+            "Detection is not automatic recording trim. It is a Replay-side suggestion. "
+            "Use Preview to inspect the proposed launch, then Apply only if it is correct."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QHBoxLayout()
+        self.preview_button = QPushButton("Preview chosen start")
+        self.preview_button.clicked.connect(self.preview_choice)
+        buttons.addWidget(self.preview_button)
+        self.apply_button = QPushButton("Apply to selected recording")
+        self.apply_button.clicked.connect(self.apply_choice)
+        buttons.addWidget(self.apply_button)
+        buttons.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        # Keep the displayed choice label synchronized with numeric/radio edits.
+        self.manual_spin.valueChanged.connect(self._refresh_choice_label)
+        self.detected_radio.toggled.connect(self._refresh_choice_label)
+        self.manual_radio.toggled.connect(self._refresh_choice_label)
+        self.raw_radio.toggled.connect(self._refresh_choice_label)
+
+        active = owner.active_session_key
+        if active is not None:
+            index = self.session_combo.findData(active)
+            if index >= 0:
+                self.session_combo.setCurrentIndex(index)
+        self._load_selected()
+
+    def _current_key(self) -> str | None:
+        value = self.session_combo.currentData()
+        return str(value) if value else None
+
+    def _settings(self) -> dict:
+        return {
+            "threshold_mps": float(self.threshold_spin.value()),
+            "required_motion_s": float(self.required_spin.value()),
+            "speed_window_s": float(self.window_spin.value()),
+            "min_displacement_m": float(self.displacement_spin.value()),
+        }
+
+    def _load_selected(self, *_args) -> None:
+        key = self._current_key()
+        if key is None or key not in self.owner.raw_sessions:
+            return
+        raw = self.owner.raw_sessions[key]
+        settings = dict(self.DEFAULT_SETTINGS)
+        settings.update(self.owner.alignment_detection_settings.get(key, {}))
+        self.threshold_spin.setValue(float(settings["threshold_mps"]))
+        self.required_spin.setValue(float(settings["required_motion_s"]))
+        self.window_spin.setValue(float(settings["speed_window_s"]))
+        self.displacement_spin.setValue(float(settings["min_displacement_m"]))
+        self.manual_spin.setMaximum(max(0.0, raw.raw_duration_s))
+
+        detected = self.owner.detected_motion_starts.get(key)
+        configured = float(self.owner.session_start_offsets.get(key, 0.0))
+        mode = self.owner.session_start_modes.get(key, "raw")
+        self.manual_spin.setValue(configured)
+        if mode == "detected" and detected is not None:
+            self.detected_radio.setChecked(True)
+        elif mode == "manual" and configured > 0.0:
+            self.manual_radio.setChecked(True)
+        else:
+            self.raw_radio.setChecked(True)
+        self._show_detected(key)
+        self._update_manual_enabled()
+        self._refresh_choice_label()
+
+    def _show_detected(self, key: str) -> None:
+        detected = self.owner.detected_motion_starts.get(key)
+        if detected is None:
+            self.detected_label.setText("Detected movement: not calculated / not found")
+            self.detected_position_label.setText("Detected position: —")
+            return
+        raw = self.owner.raw_sessions[key]
+        pose = raw.pose_at(float(detected))
+        self.detected_label.setText(
+            f"Detected movement: raw {format_time_s(float(detected))} ({float(detected):.3f} s)"
+        )
+        self.detected_position_label.setText(
+            f"Detected position: X {pose.x:.3f} m   Y {pose.y:.3f} m   Z {pose.z:.3f} m"
+        )
+
+    def _detect_key(self, key: str) -> float | None:
+        raw = self.owner.raw_sessions[key]
+        settings = self._settings()
+        detected = detect_sustained_motion_start(
+            raw.times,
+            raw.xs,
+            raw.ys,
+            threshold_mps=settings["threshold_mps"],
+            required_motion_s=settings["required_motion_s"],
+            speed_window_s=settings["speed_window_s"],
+            min_displacement_m=settings["min_displacement_m"],
+        )
+        self.owner.detected_motion_starts[key] = detected
+        self.owner.alignment_detection_settings[key] = dict(settings)
+        return detected
+
+    def detect_selected(self) -> None:
+        key = self._current_key()
+        if key is None:
+            return
+        detected = self._detect_key(key)
+        self._show_detected(key)
+        if detected is not None:
+            self.manual_spin.setValue(float(detected))
+            self.detected_radio.setChecked(True)
+        else:
+            QMessageBox.information(
+                self,
+                "No sustained movement found",
+                "The current detector settings did not find a sustained vehicle start. "
+                "Adjust the settings or choose a manual start time.",
+            )
+        self._refresh_choice_label()
+
+    def detect_all(self) -> None:
+        found = 0
+        missed: list[str] = []
+        for key in self.owner.session_order:
+            if key not in self.owner.raw_sessions:
+                continue
+            detected = self._detect_key(key)
+            if detected is None:
+                missed.append(self.owner.session_labels.get(key, Path(key).name))
+            else:
+                found += 1
+        current = self._current_key()
+        if current:
+            self._show_detected(current)
+        message = f"Detected a movement start for {found} recording(s)."
+        if missed:
+            message += "\n\nNo start found for:\n" + "\n".join(missed)
+        QMessageBox.information(self, "Detection complete", message)
+
+    def _chosen(self) -> tuple[float, str] | None:
+        key = self._current_key()
+        if key is None:
+            return None
+        if self.raw_radio.isChecked():
+            return 0.0, "raw"
+        if self.manual_radio.isChecked():
+            return float(self.manual_spin.value()), "manual"
+        detected = self.owner.detected_motion_starts.get(key)
+        if detected is None:
+            return None
+        return float(detected), "detected"
+
+    def _update_manual_enabled(self, *_args) -> None:
+        self.manual_spin.setEnabled(self.manual_radio.isChecked())
+
+    def _refresh_choice_label(self, *_args) -> None:
+        chosen = self._chosen()
+        if chosen is None:
+            self.chosen_label.setText("Replay 00:00 → no detected start selected")
+            return
+        start_s, mode = chosen
+        self.chosen_label.setText(
+            f"Replay 00:00 → raw {format_time_s(start_s)} ({start_s:.3f} s, {mode})"
+        )
+
+    def preview_choice(self) -> None:
+        key = self._current_key()
+        chosen = self._chosen()
+        if key is None or chosen is None:
+            QMessageBox.warning(self, "Nothing to preview", "Detect a start or enter a manual time first.")
+            return
+        self.owner.preview_raw_start(key, chosen[0])
+
+    def apply_choice(self) -> None:
+        key = self._current_key()
+        chosen = self._chosen()
+        if key is None or chosen is None:
+            QMessageBox.warning(self, "No valid start", "Detect a start or enter a manual start time first.")
+            return
+        start_s, mode = chosen
+        self.owner.apply_replay_start_choice(
+            key,
+            start_s,
+            mode,
+            detected_start=self.owner.detected_motion_starts.get(key),
+            settings=self._settings(),
+            persist=self.save_check.isChecked(),
+        )
+        self._refresh_choice_label()
+
+
+
 class ReplayWindow(QMainWindow):
     """Presentation layer for the replay system.
 
@@ -524,7 +839,14 @@ class ReplayWindow(QMainWindow):
 
         self.reference_path = reference_path
         self.session: SessionData | None = None
+        # Raw recordings are always kept in memory unchanged. loaded_sessions
+        # contains the current Replay view (raw or non-destructively shifted).
+        self.raw_sessions: dict[str, SessionData] = {}
         self.loaded_sessions: dict[str, SessionData] = {}
+        self.session_start_offsets: dict[str, float] = {}
+        self.session_start_modes: dict[str, str] = {}
+        self.detected_motion_starts: dict[str, float | None] = {}
+        self.alignment_detection_settings: dict[str, dict] = {}
         self.session_labels: dict[str, str] = {}
         self.session_colors: dict[str, tuple[int, int, int]] = {}
         self.session_order: list[str] = []
@@ -577,14 +899,22 @@ class ReplayWindow(QMainWindow):
         self.clear_sessions_button.clicked.connect(self.clear_sessions)
         top.addWidget(self.clear_sessions_button)
 
-        self.apply_trim_check = QCheckBox("Align driving starts")
+        self.apply_trim_check = QCheckBox("Use configured starts")
         self.apply_trim_check.setChecked(True)
         self.apply_trim_check.setToolTip(
-            "Apply each session's saved non-destructive driving-start trim. "
-            "Turn this off to inspect the raw setup/waiting period."
+            "Use the Replay-side start choices configured for each recording. "
+            "Turn this off at any time to inspect every raw recording from its original start."
         )
         self.apply_trim_check.toggled.connect(self.on_alignment_mode_changed)
         top.addWidget(self.apply_trim_check)
+
+        self.configure_starts_button = QPushButton("Configure Starts…")
+        self.configure_starts_button.setToolTip(
+            "Detect, preview, accept, or manually edit each recording's non-destructive replay start."
+        )
+        self.configure_starts_button.clicked.connect(self.configure_starts)
+        self.configure_starts_button.setEnabled(False)
+        top.addWidget(self.configure_starts_button)
 
         self.session_label = QLabel("0 recordings loaded")
         self.session_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -802,7 +1132,7 @@ class ReplayWindow(QMainWindow):
             active = self.loaded_sessions[self.active_session_key]
             label = self.session_labels[self.active_session_key]
             alignment = (
-                f"aligned +{active.analysis_start_s:.2f}s"
+                f"configured +{active.analysis_start_s:.2f}s"
                 if getattr(active, "analysis_start_s", 0.0) > 0.0
                 else "raw start"
             )
@@ -815,53 +1145,176 @@ class ReplayWindow(QMainWindow):
         self.remove_session_button.setEnabled(count > 0)
         self.clear_sessions_button.setEnabled(count > 0)
         self.active_session_combo.setEnabled(count > 0)
+        self.configure_starts_button.setEnabled(count > 0)
 
-    def on_alignment_mode_changed(self, enabled: bool) -> None:
-        """Reload in-memory sessions using raw or saved analysis time origins."""
-        if not self.loaded_sessions:
+    def configure_starts(self) -> None:
+        if not self.raw_sessions:
+            QMessageBox.information(
+                self,
+                "No recordings loaded",
+                "Load at least one recorded session before configuring replay starts.",
+            )
             return
-        self.clock.pause()
+        dialog = StartAlignmentDialog(self)
+        dialog.exec()
+
+    def _session_view(self, key: str) -> SessionData:
+        raw = self.raw_sessions[key]
+        if not self.apply_trim_check.isChecked():
+            return raw
+        start_s = max(0.0, float(self.session_start_offsets.get(key, 0.0)))
+        if start_s <= 1e-9:
+            return raw
+        return raw.with_analysis_start(start_s)
+
+    def _rebuild_session_views(self, preserve_active: bool = False) -> None:
+        if not self.raw_sessions:
+            self.loaded_sessions.clear()
+            self._refresh_session_ui()
+            return
         active_key = self.active_session_key
-        failures: list[str] = []
-        for key in list(self.session_order):
-            if key not in self.loaded_sessions:
-                continue
-            try:
-                self.loaded_sessions[key] = SessionData.load(
-                    Path(key), apply_analysis_trim=bool(enabled)
-                )
-            except Exception as exc:
-                failures.append(f"{Path(key).name}: {exc}")
+        old_time = self.clock.current_time_s if preserve_active else 0.0
+        was_multi_video = self.multi_video_mode
+        self._close_all_comparison_videos()
+        self.loaded_sessions = {
+            key: self._session_view(key)
+            for key in self.session_order
+            if key in self.raw_sessions
+        }
         if active_key in self.loaded_sessions:
             self.set_active_session(active_key, preserve_time=False)
+            if preserve_active:
+                self.clock.seek(min(old_time, self.session.duration_s if self.session else 0.0))
         else:
             self._refresh_session_ui()
-        mode = "driving-start aligned" if enabled else "raw recording start"
+        if was_multi_video:
+            self._refresh_comparison_video_windows()
+
+    def on_alignment_mode_changed(self, enabled: bool) -> None:
+        """Toggle between raw recording time and Replay-configured starts."""
+        if not self.raw_sessions:
+            return
+        self.clock.pause()
+        self._rebuild_session_views(preserve_active=False)
+        mode = "configured replay starts" if enabled else "original raw recording starts"
         self.status_label.setText(
-            f"Replay timing changed to {mode} for {len(self.loaded_sessions)} loaded session(s)."
+            f"Replay timing changed to {mode} for {len(self.loaded_sessions)} loaded recording(s)."
         )
-        if failures:
-            QMessageBox.warning(
-                self,
-                "Some sessions could not be reloaded",
-                "\n".join(failures),
-            )
+
+    def _read_saved_replay_alignment(self, session: SessionData) -> tuple[float, str, float | None, dict]:
+        replay = session.metadata.get("replay", {})
+        alignment = replay.get("start_alignment", {}) if isinstance(replay, dict) else {}
+        if not isinstance(alignment, dict):
+            return 0.0, "raw", None, {}
+        try:
+            start_s = float(alignment.get("start_s", 0.0))
+        except (TypeError, ValueError):
+            start_s = 0.0
+        start_s = max(0.0, min(start_s, session.raw_duration_s))
+        mode = str(alignment.get("mode", "raw"))
+        if mode not in {"raw", "manual", "detected"}:
+            mode = "manual" if start_s > 0.0 else "raw"
+        detected = alignment.get("detected_motion_start_s")
+        try:
+            detected_f = float(detected) if detected is not None else None
+        except (TypeError, ValueError):
+            detected_f = None
+        settings = alignment.get("detector_settings", {})
+        if not isinstance(settings, dict):
+            settings = {}
+        return start_s, mode, detected_f, dict(settings)
+
+    def preview_raw_start(self, key: str, raw_time_s: float) -> None:
+        """Show the requested raw time without changing the saved alignment choice."""
+        if key not in self.raw_sessions:
+            return
+        if key != self.active_session_key:
+            self.set_active_session(key, preserve_time=False)
+        applied_offset = (
+            float(self.session_start_offsets.get(key, 0.0))
+            if self.apply_trim_check.isChecked()
+            else 0.0
+        )
+        replay_time = max(0.0, float(raw_time_s) - applied_offset)
+        if self.session is not None:
+            replay_time = min(replay_time, self.session.duration_s)
+        self.clock.seek(replay_time)
+        self.show_video_window()
+        self.status_label.setText(
+            f"Previewing raw {format_time_s(float(raw_time_s))} for "
+            f"{self.session_labels.get(key, Path(key).name)}. No files or start settings were changed."
+        )
+
+    def apply_replay_start_choice(
+        self,
+        key: str,
+        start_s: float,
+        mode: str,
+        detected_start: float | None = None,
+        settings: dict | None = None,
+        persist: bool = True,
+    ) -> None:
+        """Apply one non-destructive Replay start choice to a loaded recording."""
+        raw = self.raw_sessions.get(key)
+        if raw is None:
+            return
+        start = max(0.0, min(float(start_s), raw.raw_duration_s))
+        if mode not in {"raw", "manual", "detected"}:
+            mode = "manual" if start > 0.0 else "raw"
+        if mode == "raw":
+            start = 0.0
+
+        self.session_start_offsets[key] = start
+        self.session_start_modes[key] = mode
+        self.detected_motion_starts[key] = detected_start
+        if settings is not None:
+            self.alignment_detection_settings[key] = dict(settings)
+
+        if persist:
+            replay = raw.metadata.setdefault("replay", {})
+            replay["start_alignment"] = {
+                "non_destructive": True,
+                "mode": mode,
+                "start_s": round(start, 6),
+                "detected_motion_start_s": (
+                    None if detected_start is None else round(float(detected_start), 6)
+                ),
+                "detector_settings": dict(settings or {}),
+            }
+            try:
+                write_json_atomic(raw.folder / "session.json", raw.metadata)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Could not save replay start",
+                    f"The start was applied in memory, but session.json could not be updated:\n{exc}",
+                )
+
+        self._rebuild_session_views(preserve_active=False)
+        if key in self.loaded_sessions:
+            self.set_active_session(key, preserve_time=False)
+        origin = "raw start" if start <= 1e-9 else f"raw +{start:.3f} s"
+        saved = " and saved" if persist else " for this Replay session"
+        self.status_label.setText(
+            f"Replay start for {self.session_labels.get(key, Path(key).name)} set to {origin}{saved}."
+        )
 
     def add_session(
         self, path: Path, make_active: bool = True, show_errors: bool = True
     ) -> bool:
         try:
-            session = SessionData.load(path, apply_analysis_trim=self.apply_trim_check.isChecked())
+            # Replay owns start alignment. Always load the recorder output raw.
+            raw_session = SessionData.load(path, apply_analysis_trim=False)
         except Exception as exc:
             if show_errors:
                 QMessageBox.critical(self, "Could not load session", str(exc))
             return False
 
-        key = str(session.folder.resolve())
-        if key not in self.loaded_sessions:
-            self.loaded_sessions[key] = session
+        key = str(raw_session.folder.resolve())
+        if key not in self.raw_sessions:
+            self.raw_sessions[key] = raw_session
             self.session_order.append(key)
-            self.session_labels[key] = self._unique_session_label(session)
+            self.session_labels[key] = self._unique_session_label(raw_session)
             used_colors = set(self.session_colors.values())
             available = [color for color in SESSION_COLORS if color not in used_colors]
             if available:
@@ -869,6 +1322,13 @@ class ReplayWindow(QMainWindow):
             else:
                 palette_index = (len(self.session_order) - 1) % len(SESSION_COLORS)
                 self.session_colors[key] = SESSION_COLORS[palette_index]
+
+            start_s, mode, detected, settings = self._read_saved_replay_alignment(raw_session)
+            self.session_start_offsets[key] = start_s
+            self.session_start_modes[key] = mode
+            self.detected_motion_starts[key] = detected
+            self.alignment_detection_settings[key] = settings
+            self.loaded_sessions[key] = self._session_view(key)
 
         if make_active or self.active_session_key is None:
             self.set_active_session(
@@ -932,6 +1392,11 @@ class ReplayWindow(QMainWindow):
         except ValueError:
             index = 0
         self.loaded_sessions.pop(key, None)
+        self.raw_sessions.pop(key, None)
+        self.session_start_offsets.pop(key, None)
+        self.session_start_modes.pop(key, None)
+        self.detected_motion_starts.pop(key, None)
+        self.alignment_detection_settings.pop(key, None)
         self.session_labels.pop(key, None)
         self.session_colors.pop(key, None)
         self.session_order = [item for item in self.session_order if item != key]
@@ -951,6 +1416,11 @@ class ReplayWindow(QMainWindow):
         self.clock.pause()
         self._close_all_comparison_videos()
         self.loaded_sessions.clear()
+        self.raw_sessions.clear()
+        self.session_start_offsets.clear()
+        self.session_start_modes.clear()
+        self.detected_motion_starts.clear()
+        self.alignment_detection_settings.clear()
         self.session_labels.clear()
         self.session_colors.clear()
         self.session_order.clear()

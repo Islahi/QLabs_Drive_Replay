@@ -103,6 +103,52 @@ class OOPArchitectureTests(unittest.TestCase):
             session = SessionData.load(session_dir)
             self.assertAlmostEqual(session.yaws[-1], 0.0, places=6)
 
+
+    def test_replay_side_analysis_start_is_non_destructive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir)
+            (session_dir / "session.json").write_text(
+                '{"format":"qlabs_drive_session","version":2,'
+                '"telemetry":{"file":"location.csv"},"replay":{}}',
+                encoding="utf-8",
+            )
+            (session_dir / "location.csv").write_text(
+                "time_s,x,y,z\n0,0,0,0\n1,0,0,0\n2,1,0,0\n3,2,0,0\n4,3,0,0\n",
+                encoding="utf-8",
+            )
+            raw = SessionData.load(session_dir, apply_analysis_trim=False)
+            aligned = raw.with_analysis_start(2.0)
+            self.assertEqual(raw.times[0], 0.0)
+            self.assertEqual(raw.sample_count, 5)
+            self.assertAlmostEqual(aligned.analysis_start_s, 2.0, places=6)
+            self.assertAlmostEqual(aligned.times[0], 0.0, places=6)
+            self.assertEqual(aligned.sample_count, 3)
+            # The source CSV is untouched by creating an aligned replay view.
+            self.assertIn("0,0,0,0", (session_dir / "location.csv").read_text(encoding="utf-8"))
+
+    def test_rolling_motion_detector_rejects_stationary_jitter(self) -> None:
+        from core.replay_core import detect_sustained_motion_start
+
+        times = [i * 0.1 for i in range(80)]
+        xs = []
+        ys = []
+        for t in times:
+            if t < 2.0:
+                xs.append(0.002 * (int(t * 10) % 2))
+            else:
+                xs.append((t - 2.0) * 1.0)
+            ys.append(0.0)
+        detected = detect_sustained_motion_start(
+            times, xs, ys,
+            threshold_mps=0.3,
+            required_motion_s=1.0,
+            speed_window_s=0.5,
+            min_displacement_m=0.3,
+        )
+        self.assertIsNotNone(detected)
+        self.assertGreaterEqual(float(detected), 1.9)
+        self.assertLessEqual(float(detected), 2.2)
+
     def test_six_lane_geometry_uses_rounded_straight_markings(self) -> None:
         # Synthetic parallel closed paths verify the calibrated straight values.
         def lane(y: float) -> list[list[float]]:
@@ -133,22 +179,3 @@ class OOPArchitectureTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-
-
-def test_detect_sustained_motion_start():
-    from core.replay_core import detect_sustained_motion_start
-
-    times = [i * 0.1 for i in range(80)]
-    xs = []
-    ys = []
-    for t in times:
-        if t < 2.0:
-            xs.append(0.002 * (int(t * 10) % 2))  # tiny stationary jitter
-        else:
-            xs.append((t - 2.0) * 1.0)
-        ys.append(0.0)
-    detected = detect_sustained_motion_start(
-        times, xs, ys, threshold_mps=0.3, required_motion_s=1.0, speed_window_s=0.5
-    )
-    assert detected is not None
-    assert 1.9 <= detected <= 2.1

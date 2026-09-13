@@ -986,19 +986,19 @@ For normal experiment days, after the first-time setup is complete, the workflow
 The goal is that **you never have to manually press OBS Record during an experiment**.
 
 
-## Camera preflight and aligned replay start
+## Camera preflight and Replay-side start alignment
 
-Before OBS begins, the recorder now preflights every selected Python CSI camera. It must successfully receive and decode one QLabs image from each selected camera and create a small `mp4v` test file. If `get_image()` blocks, no image is returned, or the MP4 encoder is unavailable, **START SESSION is refused** instead of silently producing empty camera CSV files.
+Before OBS begins, the recorder preflights every selected Python CSI camera. It must successfully receive and decode one QLabs image from each selected camera and create a small `mp4v` test file. If `get_image()` blocks, no image is returned, or the MP4 encoder is unavailable, **START SESSION is refused** instead of silently producing empty camera CSV files.
 
 Left/Right/Rear are recorded by one sequential multi-camera worker using one dedicated QLabs connection. Each camera still receives its own `csi_<camera>.mp4` and `csi_<camera>_frames.csv`. The few milliseconds between sequential camera requests are preserved in the frame timestamps.
 
-The recorder also has an optional **Replay start alignment (non-destructive)** section. Recommended comparison settings are:
+**Start alignment is no longer performed by the recorder.** The recorder always preserves the complete raw setup/waiting period. In the replay map window, click **Configure Starts…** to open the non-destructive alignment editor. For each loaded recording you can:
 
-- enable **Automatically start replay at the first sustained vehicle movement**;
-- motion threshold: **0.30 m/s**;
-- must keep moving for: **1.5 s**;
-- pre-roll: **0.0 s**.
+- run the movement detector and see the proposed raw start time plus its X/Y/Z position;
+- preview the proposed start in the synchronized map/video replay;
+- accept the detected start, type a manual raw start time, or choose the original recording start;
+- optionally save that Replay choice in `session.json` under `replay.start_alignment`.
 
-The recorder never edits or cuts `location.csv`, the OBS recording, or CSI MP4s. It saves the detected raw start time as `analysis.analysis_start_s` in `session.json`. The replay program subtracts that time so each driver's first sustained movement appears at replay `00:00.000`.
+The default detector uses a **0.30 m/s rolling speed threshold**, **1.5 s sustained movement**, a **0.50 s speed averaging window**, and **0.30 m minimum displacement from the initial position**. These values are editable in the configuration window. Detection is only a suggestion; it is never applied until you choose **Apply to selected recording**.
 
-In the replay map window, **Align driving starts** is checked by default. Uncheck it at any time to reload all open sessions from their original raw recording start and inspect the setup/waiting period.
+The **Use configured starts** checkbox applies the selected offset for each driver so their chosen launch becomes replay `00:00.000`. Uncheck it at any time to inspect every raw recording from its original start. OBS/CSI MP4 files and telemetry CSVs are never edited or cut.
