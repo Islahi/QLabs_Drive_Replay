@@ -204,13 +204,15 @@ The **Use configured starts** checkbox applies the selected offset for each driv
 
 Replay now has an optional **Align map start X** display normalization. Enter a target X coordinate (default `-0.084 m`) and every loaded trajectory is shifted only in X so its Replay `00:00` sample begins at that X. The recorded Y coordinate is preserved, so drivers starting in different lanes remain in their real lane. This affects only the map display and map-click coordinate lookup; raw telemetry and video are unchanged.
 
-For driver-comparison work, click **50 km Straight Analysis…**. This window projects each recorded XY sample onto the reconstructed Open Road median route and expresses the sample as:
+For driver-comparison work, click **50 km Live Analysis…**. This window projects each recorded XY sample onto the reconstructed Open Road median route and expresses the sample as:
 
 - route station/progress along the lap;
 - signed lateral position across the road (approximately `+10/+6/+2/-2/-6/-10 m` at the six lane centers);
 - nearest lane center and lateral lane-center error.
 
-The curved Open Road lap is then unwrapped onto a fixed **0–50 km horizontal axis**. The six lane centers, lane dividers, road edges, and median stay horizontal, so gradual drift toward a neighboring lane is easy to see. Multiple recordings are drawn together using the same colors as the replay map, and the current replay time is shown with synchronized markers.
+The curved Open Road lap is then unwrapped into a fixed **0–50 km live road view**. This is not a static chart: it behaves like the normal replay map. The six lane centers, lane dividers, road edges, and median stay horizontal, all loaded trajectories remain visible, and each car marker moves with the master replay timeline/video. Use the mouse wheel to zoom, middle/right drag to pan, double-click or **Fit 50 km** to restore the full view, and left-click the straight road to seek to the nearest loaded trajectory. **Follow active car** can automatically pan a zoomed view as the active replay moves.
+
+The chart-style 0–50 km plot is **not shown during normal replay**. It is generated only when you click **Export Plot PNG…**.
 
 Leave **Start each recording at 0 km** enabled for the recommended comparison mode. It makes the selected Replay start for every driver the 0 km origin, independent of small differences in the raw world-space starting X. This is separate from the optional top-down map X shift.
 

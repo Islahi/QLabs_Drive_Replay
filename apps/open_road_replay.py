@@ -18,7 +18,7 @@ from pathlib import Path
 import sys
 
 from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QCursor, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
+from PySide6.QtGui import QColor, QCursor, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -826,12 +826,330 @@ class StartAlignmentDialog(QDialog):
 
 
 
-class StraightRoadPlot(QWidget):
-    """Straightened six-lane 0..50 km comparison plot."""
+class StraightRoadLiveView(QWidget):
+    """Interactive live 50 km straight-road replay view.
+
+    Unlike the export plot, this behaves like the normal map: loaded trajectories
+    stay visible, every driver's current position moves with the replay clock,
+    and the user can zoom/pan/seek directly on the straightened road.
+    """
+
+    roadClicked = Signal(float, float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setMinimumSize(1050, 560)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.entries: dict[str, dict] = {}
+        self.current_time_s = 0.0
+        self.x_min_km = 0.0
+        self.x_max_km = 50.0
+        self.view_center_km = 25.0
+        self.view_span_km = 50.0
+        self.lat_min = -13.0
+        self.lat_max = 13.0
+        self.follow_active = False
+        self._pan_active = False
+        self._pan_last = QPointF()
+        self.hover_road: tuple[float, float] | None = None
+        self.last_clicked_road: tuple[float, float] | None = None
+
+    def set_entries(self, entries: list[dict]) -> None:
+        self.entries = {str(entry["key"]): entry for entry in entries}
+        self.update()
+
+    def set_follow_active(self, enabled: bool) -> None:
+        self.follow_active = bool(enabled)
+        if self.follow_active:
+            self._follow_current_active()
+        self.update()
+
+    def set_time(self, time_s: float) -> None:
+        self.current_time_s = float(time_s)
+        if self.follow_active:
+            self._follow_current_active()
+        self.update()
+
+    def fit_all(self) -> None:
+        self.view_span_km = 50.0
+        self.view_center_km = 25.0
+        self.update()
+
+    def set_view_span(self, span_km: float) -> None:
+        self.view_span_km = max(0.25, min(50.0, float(span_km)))
+        self._clamp_view()
+        if self.follow_active:
+            self._follow_current_active()
+        self.update()
+
+    def _active_entry(self) -> dict | None:
+        for entry in self.entries.values():
+            if entry.get("active"):
+                return entry
+        return None
+
+    @staticmethod
+    def _sample_at_time(entry: dict, time_s: float) -> StraightRoadSample | None:
+        samples: list[StraightRoadSample] = entry.get("samples", [])
+        times: list[float] = entry.get("times", [])
+        if not samples or not times or time_s < times[0] or time_s > times[-1]:
+            return None
+        right = bisect_right(times, float(time_s))
+        index = max(0, min(len(samples) - 1, right - 1))
+        return samples[index]
+
+    def _follow_current_active(self) -> None:
+        if self.view_span_km >= 49.999:
+            return
+        entry = self._active_entry()
+        if entry is None:
+            return
+        sample = self._sample_at_time(entry, self.current_time_s)
+        if sample is None:
+            return
+        margin = self.view_span_km * 0.22
+        left, right = self._visible_range()
+        x = float(sample.display_distance_km)
+        if x < left + margin or x > right - margin:
+            self.view_center_km = x
+            self._clamp_view()
+
+    def _visible_range(self) -> tuple[float, float]:
+        half = self.view_span_km / 2.0
+        return self.view_center_km - half, self.view_center_km + half
+
+    def _clamp_view(self) -> None:
+        half = self.view_span_km / 2.0
+        if self.view_span_km >= 50.0:
+            self.view_center_km = 25.0
+            return
+        self.view_center_km = max(half, min(50.0 - half, self.view_center_km))
+
+    def _view_rect(self):
+        left = 16.0
+        right = 16.0
+        top = 34.0
+        bottom = 30.0
+        return left, top, max(1.0, self.width() - left - right), max(1.0, self.height() - top - bottom)
+
+    def road_to_screen(self, distance_km: float, lateral_m: float) -> QPointF:
+        left, top, width, height = self._view_rect()
+        view_left, view_right = self._visible_range()
+        x = left + (float(distance_km) - view_left) / max(1e-9, view_right - view_left) * width
+        y = top + (self.lat_max - float(lateral_m)) / (self.lat_max - self.lat_min) * height
+        return QPointF(x, y)
+
+    def screen_to_road(self, pos: QPointF) -> tuple[float, float]:
+        left, top, width, height = self._view_rect()
+        view_left, view_right = self._visible_range()
+        distance_km = view_left + (pos.x() - left) / max(1e-9, width) * (view_right - view_left)
+        lateral_m = self.lat_max - (pos.y() - top) / max(1e-9, height) * (self.lat_max - self.lat_min)
+        return distance_km, lateral_m
+
+    def _draw_road(self, painter: QPainter) -> None:
+        left, top, width, height = self._view_rect()
+        view_left, view_right = self._visible_range()
+
+        # Constant-width straightened road. The vertical scale is intentionally
+        # exaggerated relative to the 50 km longitudinal axis so lane drift is
+        # easy to see during live playback.
+        upper_top = self.road_to_screen(view_left, 12.0).y()
+        upper_bottom = self.road_to_screen(view_left, 0.6).y()
+        lower_top = self.road_to_screen(view_left, -0.6).y()
+        lower_bottom = self.road_to_screen(view_left, -12.0).y()
+        painter.fillRect(int(left), int(upper_top), int(width), int(upper_bottom - upper_top), QColor(75, 81, 90))
+        painter.fillRect(int(left), int(lower_top), int(width), int(lower_bottom - lower_top), QColor(75, 81, 90))
+        median_top = self.road_to_screen(view_left, 0.6).y()
+        median_bottom = self.road_to_screen(view_left, -0.6).y()
+        painter.fillRect(int(left), int(median_top), int(width), int(median_bottom - median_top), QColor(164, 155, 128))
+
+        edge_pen = QPen(QColor(248, 249, 251), 3.0)
+        edge_pen.setCosmetic(True)
+        painter.setPen(edge_pen)
+        for lateral in (12.0, 0.6, -0.6, -12.0):
+            painter.drawLine(self.road_to_screen(view_left, lateral), self.road_to_screen(view_right, lateral))
+
+        divider_pen = QPen(QColor(252, 252, 252), 3.0)
+        divider_pen.setCosmetic(True)
+        divider_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(divider_pen)
+        for lateral in (8.0, 4.0, -4.0, -8.0):
+            painter.drawLine(self.road_to_screen(view_left, lateral), self.road_to_screen(view_right, lateral))
+
+        center_pen = QPen(QColor(132, 158, 178, 125), 1.0)
+        center_pen.setCosmetic(True)
+        center_pen.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(center_pen)
+        for lateral in (10.0, 6.0, 2.0, -2.0, -6.0, -10.0):
+            painter.drawLine(self.road_to_screen(view_left, lateral), self.road_to_screen(view_right, lateral))
+
+        # Kilometer posts rather than chart axes. Spacing adapts to zoom.
+        span = self.view_span_km
+        if span > 30.0:
+            step = 5.0
+        elif span > 12.0:
+            step = 2.0
+        elif span > 5.0:
+            step = 1.0
+        elif span > 2.0:
+            step = 0.5
+        else:
+            step = 0.1
+        first = math.ceil(max(0.0, view_left) / step) * step
+        km = first
+        while km <= min(50.0, view_right) + 1e-9:
+            x = self.road_to_screen(km, 0.0).x()
+            grid_pen = QPen(QColor(125, 132, 142, 70), 1.0)
+            grid_pen.setCosmetic(True)
+            painter.setPen(grid_pen)
+            painter.drawLine(QPointF(x, top), QPointF(x, top + height))
+            painter.setPen(QColor(225, 229, 234))
+            label = f"{km:.1f} km" if step < 1.0 else f"{km:g} km"
+            painter.drawText(QPointF(x + 4.0, top + 16.0), label)
+            km += step
+
+        lane_labels = [
+            (10.0, "Upper Right"), (6.0, "Upper Middle"), (2.0, "Upper Left"),
+            (-2.0, "Lower Right"), (-6.0, "Lower Middle"), (-10.0, "Lower Left"),
+        ]
+        painter.setPen(QColor(222, 227, 232, 210))
+        for lateral, label in lane_labels:
+            y = self.road_to_screen(view_left, lateral).y()
+            painter.drawText(QPointF(left + 8.0, y - 5.0), label)
+
+    def _draw_trajectories(self, painter: QPainter) -> None:
+        view_left, view_right = self._visible_range()
+        items = list(self.entries.values())
+        items.sort(key=lambda entry: bool(entry.get("active")))
+        for entry in items:
+            samples: list[StraightRoadSample] = entry.get("samples", [])
+            if not samples:
+                continue
+            path = QPainterPath()
+            started = False
+            for sample in samples:
+                d = float(sample.display_distance_km)
+                if d < view_left - 0.05 or d > view_right + 0.05:
+                    if started and d > view_right:
+                        break
+                    continue
+                p = self.road_to_screen(d, sample.lateral_m)
+                if not started:
+                    path.moveTo(p)
+                    started = True
+                else:
+                    path.lineTo(p)
+            if not started:
+                continue
+            color = QColor(*entry["color"])
+            pen = QPen(color, 3.4 if entry.get("active") else 2.2)
+            pen.setCosmetic(True)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+
+        marker_row = 0
+        for entry in items:
+            current = self._sample_at_time(entry, self.current_time_s)
+            if current is None:
+                continue
+            if not (view_left <= current.display_distance_km <= view_right):
+                continue
+            p = self.road_to_screen(current.display_distance_km, current.lateral_m)
+            color = QColor(*entry["color"])
+            active = bool(entry.get("active"))
+            painter.setPen(QPen(QColor(246, 249, 251), 2.0 if active else 1.2))
+            fill = QColor(color)
+            fill.setAlpha(225)
+            painter.setBrush(fill)
+            radius = 8.0 if active else 6.0
+            painter.drawEllipse(p, radius, radius)
+
+            painter.setPen(QColor(238, 242, 246))
+            label = str(entry["label"])
+            if len(label) > 24:
+                label = label[:21] + "…"
+            prefix = "ACTIVE: " if active else ""
+            painter.drawText(p + QPointF(10.0, -10.0 - (marker_row % 2) * 11.0), prefix + label)
+            marker_row += 1
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(31, 35, 41))
+        self._draw_road(painter)
+        self._draw_trajectories(painter)
+
+        painter.setPen(QColor(228, 233, 238))
+        view_left, view_right = self._visible_range()
+        painter.drawText(16, 22, f"Live straightened Open Road   view {max(0.0, view_left):.2f}–{min(50.0, view_right):.2f} km")
+        if self.hover_road is not None:
+            painter.drawText(
+                max(16, self.width() - 310), 22,
+                f"Cursor {self.hover_road[0]:.3f} km   lateral {self.hover_road[1]:+.2f} m",
+            )
+        painter.setPen(QColor(184, 192, 201))
+        painter.drawText(
+            16,
+            self.height() - 9,
+            "Colored lines: full recorded paths   Dots: live replay positions   |   Left click: seek   Wheel: zoom   Middle/right drag: pan",
+        )
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        pos = event.position()
+        self.hover_road = self.screen_to_road(pos)
+        if self._pan_active:
+            delta = pos - self._pan_last
+            _left, _top, width, _height = self._view_rect()
+            self.view_center_km -= delta.x() / max(1.0, width) * self.view_span_km
+            self._clamp_view()
+            self._pan_last = pos
+        self.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+            self._pan_active = True
+            self._pan_last = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            distance_km, lateral_m = self.screen_to_road(event.position())
+            distance_km = max(0.0, min(50.0, distance_km))
+            self.last_clicked_road = (distance_km, lateral_m)
+            self.roadClicked.emit(distance_km, lateral_m)
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+            self._pan_active = False
+            self.unsetCursor()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        before_km, _ = self.screen_to_road(event.position())
+        steps = event.angleDelta().y() / 120.0
+        new_span = max(0.25, min(50.0, self.view_span_km / (1.25 ** steps)))
+        if abs(new_span - self.view_span_km) < 1e-12:
+            return
+        left, _top, width, _height = self._view_rect()
+        fraction = (event.position().x() - left) / max(1.0, width)
+        fraction = max(0.0, min(1.0, fraction))
+        self.view_span_km = new_span
+        self.view_center_km = before_km - (fraction - 0.5) * new_span
+        self._clamp_view()
+        self.update()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        self.fit_all()
+
+
+class StraightRoadExportPlot(QWidget):
+    """Publication/export plot; created only when the user exports a PNG."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
         self.entries: dict[str, dict] = {}
         self.current_time_s = 0.0
         self.x_max_km = 50.0
@@ -859,23 +1177,12 @@ class StraightRoadPlot(QWidget):
         y = top + (self.lat_max - float(lateral_m)) / (self.lat_max - self.lat_min) * height
         return QPointF(x, y)
 
-    def _sample_at_time(self, entry: dict, time_s: float) -> StraightRoadSample | None:
-        samples: list[StraightRoadSample] = entry.get("samples", [])
-        times: list[float] = entry.get("times", [])
-        if not samples or not times or time_s < times[0] or time_s > times[-1]:
-            return None
-        right = bisect_right(times, float(time_s))
-        index = max(0, min(len(samples) - 1, right - 1))
-        return samples[index]
-
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.fillRect(self.rect(), QColor(28, 31, 36))
         left, top, width, height = self._plot_rect()
 
-        # Road surface and median are drawn in lateral coordinates, so the lane
-        # structure remains visually constant across the complete 50 km axis.
         upper_top = self._screen(0.0, 12.0).y()
         upper_bottom = self._screen(0.0, 0.6).y()
         lower_top = self._screen(0.0, -0.6).y()
@@ -886,7 +1193,6 @@ class StraightRoadPlot(QWidget):
         median_bottom = self._screen(0.0, -0.6).y()
         painter.fillRect(int(left), int(median_top), int(width), int(median_bottom - median_top), QColor(164, 155, 128))
 
-        # Vertical distance grid every 5 km, with stronger 10 km labels.
         for km in range(0, 51, 5):
             p0 = self._screen(float(km), self.lat_min)
             p1 = self._screen(float(km), self.lat_max)
@@ -897,7 +1203,6 @@ class StraightRoadPlot(QWidget):
             painter.setPen(QColor(218, 223, 228))
             painter.drawText(QPointF(p0.x() - 12.0, top + height + 24.0), f"{km}")
 
-        # Lane boundaries and centers use the rounded straight calibration.
         edge_pen = QPen(QColor(248, 249, 251), 2.8)
         edge_pen.setCosmetic(True)
         painter.setPen(edge_pen)
@@ -926,7 +1231,6 @@ class StraightRoadPlot(QWidget):
             painter.drawText(QPointF(8.0, y), label)
             painter.setPen(center_pen)
 
-        # Draw every driver's lateral trajectory over the straightened road.
         for entry in self.entries.values():
             samples = entry.get("samples", [])
             if not samples:
@@ -946,15 +1250,6 @@ class StraightRoadPlot(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawPath(path)
 
-            current = self._sample_at_time(entry, self.current_time_s)
-            if current is not None and 0.0 <= current.display_distance_km <= 50.0:
-                point = self._screen(current.display_distance_km, current.lateral_m)
-                painter.setPen(QPen(QColor(245, 248, 250), 1.3))
-                painter.setBrush(color)
-                radius = 6.0 if entry.get("active") else 4.5
-                painter.drawEllipse(point, radius, radius)
-
-        # Axis labels and legend.
         painter.setPen(QColor(235, 239, 243))
         painter.drawText(QPointF(left + width / 2.0 - 90.0, self.height() - 12.0), "Normalized route distance (km)")
         painter.drawText(QPointF(left, 22.0), "Straightened Open Road — lateral position (m); lane centers ±10, ±6, ±2")
@@ -974,15 +1269,16 @@ class StraightRoadPlot(QWidget):
 
 
 class StraightRoadAnalysisWindow(QMainWindow):
-    """Multi-session lateral-position view with CSV/PNG export."""
+    """Live multi-session straight-road replay with CSV/plot export."""
 
     def __init__(self, owner, projector: RoadCoordinateProjector) -> None:
         super().__init__(owner)
         self.owner = owner
         self.projector = projector
-        self.setWindowTitle("50 km Straightened Open Road Analysis")
+        self.setWindowTitle("50 km Straightened Open Road — Live Analysis")
         self.resize(1320, 720)
         self._plot_cache: dict[tuple[str, int, bool], list[StraightRoadSample]] = {}
+        self._entries: list[dict] = []
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -998,6 +1294,20 @@ class StraightRoadAnalysisWindow(QMainWindow):
         self.normalize_check.toggled.connect(lambda _checked: self.refresh_from_owner())
         controls.addWidget(self.normalize_check)
 
+        self.follow_check = QCheckBox("Follow active car")
+        self.follow_check.setChecked(False)
+        self.follow_check.setToolTip("When zoomed in, automatically pan the straight-road view as the active car moves.")
+        self.follow_check.toggled.connect(self._set_follow)
+        controls.addWidget(self.follow_check)
+
+        fit_button = QPushButton("Fit 50 km")
+        fit_button.clicked.connect(self._fit_all)
+        controls.addWidget(fit_button)
+
+        zoom5_button = QPushButton("5 km view")
+        zoom5_button.clicked.connect(lambda: self.live_view.set_view_span(5.0))
+        controls.addWidget(zoom5_button)
+
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh_from_owner)
         controls.addWidget(refresh)
@@ -1007,17 +1317,26 @@ class StraightRoadAnalysisWindow(QMainWindow):
         controls.addWidget(export_csv)
 
         export_png = QPushButton("Export Plot PNG…")
+        export_png.setToolTip("Generate the full 0–50 km analysis plot only when exporting. The on-screen view remains the live road replay.")
         export_png.clicked.connect(self.export_png)
         controls.addWidget(export_png)
         controls.addStretch(1)
 
-        self.plot = StraightRoadPlot()
-        layout.addWidget(self.plot, 1)
+        self.live_view = StraightRoadLiveView()
+        self.live_view.roadClicked.connect(self._seek_from_live_view)
+        layout.addWidget(self.live_view, 1)
         self.status = QLabel(
-            "The curved Open Road is unwrapped to 0–50 km. Vertical position is signed lateral position across the six lanes."
+            "Live 50 km road replay. Car markers move with the master timeline; wheel zoom and middle/right drag work like the normal map."
         )
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+
+    def _set_follow(self, enabled: bool) -> None:
+        self.live_view.set_follow_active(enabled)
+
+    def _fit_all(self) -> None:
+        self.follow_check.setChecked(False)
+        self.live_view.fit_all()
 
     def refresh_from_owner(self) -> None:
         entries: list[dict] = []
@@ -1048,15 +1367,51 @@ class StraightRoadAnalysisWindow(QMainWindow):
                 })
         finally:
             QApplication.restoreOverrideCursor()
-        self.plot.set_entries(entries)
-        self.plot.set_time(self.owner.clock.current_time_s)
+        self._entries = entries
+        self.live_view.set_entries(entries)
+        self.live_view.set_time(self.owner.clock.current_time_s)
+        self.live_view.set_follow_active(self.follow_check.isChecked())
         self.status.setText(
-            f"{len(entries)} recording(s) plotted. One reference lap ({self.projector.length_m/1000.0:.2f} km) is normalized to a 50.00 km horizontal axis. "
-            "CSV export includes route progress, lateral position, nearest lane, and lane-center error."
+            f"{len(entries)} recording(s) in the live straight-road view. One reference lap ({self.projector.length_m/1000.0:.2f} km) is normalized to 50.00 km. "
+            "Use the timeline/video normally; the car markers here update at the same replay time."
         )
 
     def set_time(self, time_s: float) -> None:
-        self.plot.set_time(time_s)
+        self.live_view.set_time(time_s)
+
+    def _seek_from_live_view(self, distance_km: float, lateral_m: float) -> None:
+        if not self._entries:
+            return
+        # Select the recording whose straightened trajectory passes nearest the
+        # click, then seek that session to the corresponding replay timestamp.
+        best: tuple[float, dict, StraightRoadSample] | None = None
+        for entry in self._entries:
+            samples: list[StraightRoadSample] = entry.get("samples", [])
+            if not samples:
+                continue
+            # Horizontal distance is converted back to metres so both dimensions
+            # participate in one intuitive nearest-point score.
+            sample = min(
+                samples,
+                key=lambda item: (
+                    (float(item.display_distance_km) - float(distance_km)) * 1000.0
+                ) ** 2 + (float(item.lateral_m) - float(lateral_m)) ** 2,
+            )
+            score = ((sample.display_distance_km - distance_km) * 1000.0) ** 2 + (sample.lateral_m - lateral_m) ** 2
+            if best is None or score < best[0]:
+                best = (score, entry, sample)
+        if best is None:
+            return
+        _score, entry, sample = best
+        key = str(entry["key"])
+        if key != self.owner.active_session_key:
+            self.owner.set_active_session(key, preserve_time=False)
+        self.owner.coordinator.force_sync()
+        self.owner._force_comparison_video_sync()
+        self.owner.clock.seek(float(sample.time_s))
+        self.status.setText(
+            f"Seek: {entry['label']} at {sample.display_distance_km:.3f} km, lateral {sample.lateral_m:+.2f} m, replay {format_time_s(sample.time_s)}."
+        )
 
     def export_png(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -1066,11 +1421,26 @@ class StraightRoadAnalysisWindow(QMainWindow):
             return
         if not path.lower().endswith(".png"):
             path += ".png"
-        image = self.plot.grab()
+        if not self._entries:
+            QMessageBox.information(self, "Nothing to export", "Load at least one recording first.")
+            return
+
+        # The chart-style plot exists only for export. It is rendered off-screen
+        # and is never used as the live analysis UI.
+        plot = StraightRoadExportPlot()
+        plot.resize(1800, 900)
+        plot.set_entries(self._entries)
+        plot.set_time(self.owner.clock.current_time_s)
+        image = QImage(1800, 900, QImage.Format.Format_ARGB32)
+        image.fill(QColor(28, 31, 36))
+        painter = QPainter(image)
+        plot.render(painter)
+        painter.end()
+        plot.deleteLater()
         if not image.save(path, "PNG"):
             QMessageBox.warning(self, "Export failed", f"Could not save PNG:\n{path}")
             return
-        self.status.setText(f"Plot exported to {path}")
+        self.status.setText(f"Full 0–50 km analysis plot exported to {path}")
 
     def export_csv(self) -> None:
         if not self.owner.loaded_sessions:
@@ -1249,9 +1619,9 @@ class ReplayWindow(QMainWindow):
         self.align_map_x_spin.valueChanged.connect(self.on_position_alignment_changed)
         position_row.addWidget(self.align_map_x_spin)
 
-        self.straight_analysis_button = QPushButton("50 km Straight Analysis…")
+        self.straight_analysis_button = QPushButton("50 km Live Analysis…")
         self.straight_analysis_button.setToolTip(
-            "Unwrap the Open Road into a straight 0–50 km six-lane view for lateral-position comparison and CSV/PNG export."
+            "Open a live synchronized straightened 0–50 km six-lane road view; export CSV or a full plot only when needed."
         )
         self.straight_analysis_button.clicked.connect(self.show_straight_analysis)
         self.straight_analysis_button.setEnabled(lane_geometry is not None)
