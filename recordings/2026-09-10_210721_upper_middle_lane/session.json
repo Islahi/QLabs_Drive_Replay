@@ -40,7 +40,7 @@
     "qlabs_front": {
       "kind": "obs_qlabs_window",
       "label": "QLabs Front (OBS)",
-      "path": "C:/Users/admin/Videos/2026-09-10 21-07-21.mp4",
+      "path": "C:/Users/quanser/Videos/2026-09-10 21-07-21.mp4",
       "sync_file": "obs_sync.csv",
       "preferred": true
     },
@@ -105,7 +105,7 @@
     "host": "localhost",
     "port": 4455,
     "sync_file": "obs_sync.csv",
-    "recording_path": "C:/Users/admin/Videos/2026-09-10 21-07-21.mp4",
+    "recording_path": "C:/Users/quanser/Videos/2026-09-10 21-07-21.mp4",
     "sync_samples": 3964
   }
 }
