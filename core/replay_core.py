@@ -20,6 +20,41 @@ SESSION_VERSION = 2
 DEFAULT_SAMPLE_RATE_HZ = 20.0
 
 
+OPEN_ROAD_LANE_REFERENCE_FILES = {
+    "upper_right": "open_road_reference_upper_right_lane.json",
+    "upper_middle": "open_road_reference_upper_middle_lane.json",
+    "upper_left": "open_road_reference_upper_left_lane.json",
+    "lower_right": "open_road_reference_lower_right_lane.json",
+    "lower_middle": "open_road_reference_lower_middle_lane.json",
+    "lower_left": "open_road_reference_lower_left_lane.json",
+}
+
+# Straight-road calibration from the QLabs coordinate-helper screenshots.
+# Lane centers are the measured JSON trajectories at +/-10, +/-6 and +/-2 m.
+# The painted dividers round cleanly to +/-8 and +/-4 m, outer edges to +/-12 m,
+# and the two median-side pavement edges are approximately +/-0.6 m.
+OPEN_ROAD_MEDIAN_HALF_WIDTH_M = 0.6
+OPEN_ROAD_CARRIAGEWAY_WIDTH_M = 12.0 - OPEN_ROAD_MEDIAN_HALF_WIDTH_M
+
+
+@dataclass(frozen=True)
+class OpenRoadLaneGeometry:
+    lane_centers: dict[str, list[list[float]]]
+    lane_dividers: dict[str, list[list[float]]]
+    outer_edges: dict[str, list[list[float]]]
+    median_edges: dict[str, list[list[float]]]
+    median_center: list[list[float]]
+
+    def all_xy_paths(self) -> list[list[list[float]]]:
+        return (
+            list(self.lane_centers.values())
+            + list(self.lane_dividers.values())
+            + list(self.outer_edges.values())
+            + list(self.median_edges.values())
+            + [self.median_center]
+        )
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -62,6 +97,47 @@ def write_json_atomic(path: Path, document: dict) -> None:
         handle.write("\n")
         handle.flush()
     temporary.replace(path)
+
+
+def detect_sustained_motion_start(
+    times: Sequence[float],
+    xs: Sequence[float],
+    ys: Sequence[float],
+    threshold_mps: float = 0.30,
+    required_motion_s: float = 1.5,
+    speed_window_s: float = 0.50,
+) -> float | None:
+    """Return the first sustained-driving time from timestamped XY samples.
+
+    The detector intentionally does not trigger on one noisy position jump: the
+    instantaneous XY speed must stay above ``threshold_mps`` for
+    ``required_motion_s``.  ``speed_window_s`` is retained in the session
+    metadata/API for compatibility and future smoothing, while sustained-time
+    validation provides the primary jitter rejection.
+    """
+    if not (len(times) == len(xs) == len(ys)) or len(times) < 2:
+        return None
+    threshold = max(0.0, float(threshold_mps))
+    required = max(0.0, float(required_motion_s))
+    run_start: float | None = None
+    for i in range(1, len(times)):
+        t0 = float(times[i - 1])
+        t1 = float(times[i])
+        dt = t1 - t0
+        if dt <= 0:
+            continue
+        speed = math.hypot(
+            float(xs[i]) - float(xs[i - 1]),
+            float(ys[i]) - float(ys[i - 1]),
+        ) / dt
+        if speed >= threshold:
+            if run_start is None:
+                run_start = t0
+            if t1 - run_start >= required:
+                return run_start
+        else:
+            run_start = None
+    return None
 
 
 def new_session_document(
@@ -147,6 +223,8 @@ class SessionData:
         ys: list[float],
         zs: list[float],
         recorded_yaws: list[float | None] | None = None,
+        analysis_start_s: float = 0.0,
+        raw_duration_s: float | None = None,
     ) -> None:
         if not times:
             raise ValueError("The recording contains no valid location samples.")
@@ -155,6 +233,8 @@ class SessionData:
 
         self.folder = Path(folder).resolve()
         self.metadata = metadata
+        self.analysis_start_s = max(0.0, float(analysis_start_s))
+        self.raw_duration_s = float(raw_duration_s) if raw_duration_s is not None else float(times[-1])
         self.times = times
         self.xs = xs
         self.ys = ys
@@ -169,7 +249,9 @@ class SessionData:
             ]
 
     @classmethod
-    def load(cls, path: Path | str) -> "SessionData":
+    def load(
+        cls, path: Path | str, apply_analysis_trim: bool = True
+    ) -> "SessionData":
         path = Path(path).expanduser().resolve()
         if path.is_dir():
             session_json = path / "session.json"
@@ -257,9 +339,41 @@ class SessionData:
             if abs(first_time) > 1e-9:
                 times = [t - first_time for t in times]
 
+        raw_duration_s = float(times[-1])
+        analysis_start_s = 0.0
+        analysis = metadata.get("analysis", {})
+        if apply_analysis_trim and isinstance(analysis, dict):
+            enabled = bool(
+                analysis.get("auto_trim_stationary_start",
+                             analysis.get("auto_align_replay", False))
+            )
+            candidate = analysis.get("analysis_start_s")
+            try:
+                candidate_f = float(candidate) if candidate is not None else 0.0
+            except (TypeError, ValueError):
+                candidate_f = 0.0
+            if enabled and math.isfinite(candidate_f) and candidate_f > 0.0:
+                analysis_start_s = min(candidate_f, raw_duration_s)
+
+        if analysis_start_s > 0.0:
+            # The raw CSV/video files remain untouched.  Replay simply slices
+            # away samples before the saved analysis origin and shifts its clock.
+            first_index = 0
+            while first_index < len(times) and times[first_index] < analysis_start_s:
+                first_index += 1
+            if first_index >= len(times):
+                first_index = len(times) - 1
+            times = [max(0.0, t - analysis_start_s) for t in times[first_index:]]
+            xs = xs[first_index:]
+            ys = ys[first_index:]
+            zs = zs[first_index:]
+            recorded_yaws = recorded_yaws[first_index:]
+
         return cls(
             session_json.parent, metadata, times, xs, ys, zs,
             recorded_yaws=recorded_yaws,
+            analysis_start_s=analysis_start_s,
+            raw_duration_s=raw_duration_s,
         )
 
     @property
@@ -619,3 +733,282 @@ def offset_polyline_xy(
         normal_x, normal_y = -ty / length, tx / length
         result.append((x + normal_x * offset_m, y + normal_y * offset_m))
     return result
+
+
+def find_open_road_lane_reference_files(reference_path: Path) -> dict[str, Path]:
+    """Return all six measured Open Road lane-reference files when available.
+
+    The search is intentionally anchored to the directory containing the normal
+    open_road_reference.json so a copied repository remains self-contained.
+    An empty dictionary means the reviewer should use the legacy single-reference
+    rendering instead of partially mixing reference models.
+    """
+    data_dir = Path(reference_path).resolve().parent
+    found = {
+        name: data_dir / filename
+        for name, filename in OPEN_ROAD_LANE_REFERENCE_FILES.items()
+    }
+    if not all(path.is_file() for path in found.values()):
+        return {}
+    return {name: path.resolve() for name, path in found.items()}
+
+
+def resample_polyline_by_distance_fraction(
+    points: list[list[float]],
+    sample_count: int = 1600,
+) -> list[list[float]]:
+    """Resample a closed/open XYZ polyline uniformly by normalized XY arc length."""
+    if len(points) < 2:
+        return [list(p) for p in points]
+    sample_count = max(16, int(sample_count))
+
+    clean = [list(map(float, p[:3])) for p in points if len(p) >= 3]
+    if len(clean) < 2:
+        return clean
+
+    # Avoid a duplicated closure point while computing the cumulative distance.
+    closed = math.hypot(
+        clean[-1][0] - clean[0][0], clean[-1][1] - clean[0][1]
+    ) < 1e-6
+    if closed and len(clean) > 2:
+        clean = clean[:-1]
+
+    distances = cumulative_xy_distances(clean)
+    total = distances[-1]
+    if total <= 1e-9:
+        result = [list(clean[0]) for _ in range(sample_count)]
+        if closed:
+            result.append(list(result[0]))
+        return result
+
+    result: list[list[float]] = []
+    targets = [total * i / sample_count for i in range(sample_count)]
+    segment = 0
+    for target in targets:
+        while segment + 1 < len(distances) and distances[segment + 1] < target:
+            segment += 1
+        next_segment = min(segment + 1, len(clean) - 1)
+        d0 = distances[segment]
+        d1 = distances[next_segment]
+        alpha = 0.0 if d1 <= d0 else (target - d0) / (d1 - d0)
+        a = clean[segment]
+        b = clean[next_segment]
+        result.append([
+            a[0] + alpha * (b[0] - a[0]),
+            a[1] + alpha * (b[1] - a[1]),
+            a[2] + alpha * (b[2] - a[2]),
+        ])
+
+    if closed and result:
+        result.append(list(result[0]))
+    return result
+
+
+def blend_paths(
+    path_a: list[list[float]],
+    path_b: list[list[float]],
+    weight_b: float,
+) -> list[list[float]]:
+    """Blend already aligned XYZ paths; weight_b=0.5 gives their midpoint."""
+    if len(path_a) != len(path_b):
+        raise ValueError("Aligned Open Road paths must have equal sample counts.")
+    w = float(weight_b)
+    return [
+        [
+            float(a[0]) + w * (float(b[0]) - float(a[0])),
+            float(a[1]) + w * (float(b[1]) - float(a[1])),
+            float(a[2]) + w * (float(b[2]) - float(a[2])),
+        ]
+        for a, b in zip(path_a, path_b)
+    ]
+
+
+def extrapolate_from_neighbor(
+    outer: list[list[float]],
+    inner: list[list[float]],
+    factor: float,
+) -> list[list[float]]:
+    """Move from an outer lane center away from its adjacent inner center."""
+    if len(outer) != len(inner):
+        raise ValueError("Aligned Open Road paths must have equal sample counts.")
+    f = float(factor)
+    return [
+        [
+            float(a[0]) + f * (float(a[0]) - float(b[0])),
+            float(a[1]) + f * (float(a[1]) - float(b[1])),
+            float(a[2]) + f * (float(a[2]) - float(b[2])),
+        ]
+        for a, b in zip(outer, inner)
+    ]
+
+
+def align_target_to_reference(
+    reference: list[list[float]],
+    target: list[list[float]],
+    search_window: int = 18,
+) -> list[list[float]]:
+    """Project each reference sample to the nearby portion of a target lane.
+
+    Lane loops have slightly different arc lengths, so pairing them by the same
+    normalized distance fraction can shift curved sections by several metres.
+    We use normalized progress only as a search hint, then choose the nearest
+    local target segment geometrically. This preserves route order while keeping
+    adjacent lane geometry spatially aligned.
+    """
+    if len(reference) < 2 or len(target) < 2:
+        return [list(p) for p in target]
+
+    ref_closed = math.hypot(
+        reference[-1][0] - reference[0][0], reference[-1][1] - reference[0][1]
+    ) < 1e-6
+    tgt_closed = math.hypot(
+        target[-1][0] - target[0][0], target[-1][1] - target[0][1]
+    ) < 1e-6
+
+    ref_core = reference[:-1] if ref_closed else reference
+    tgt_core = target[:-1] if tgt_closed else target
+    n_ref = len(ref_core)
+    n_tgt = len(tgt_core)
+    if n_ref < 2 or n_tgt < 2:
+        return [list(p) for p in target]
+
+    window = max(3, int(search_window))
+    result: list[list[float]] = []
+
+    for i, p in enumerate(ref_core):
+        # Preserve exact common start calibration, e.g. lane centers at
+        # +/-10, +/-6 and +/-2 m on the straight section.
+        if i == 0:
+            result.append(list(tgt_core[0]))
+            continue
+
+        fraction = i / n_ref if ref_closed else i / max(1, n_ref - 1)
+        expected = int(round(fraction * n_tgt)) % n_tgt
+        best: tuple[float, list[float]] | None = None
+
+        for delta in range(-window, window + 1):
+            j0 = (expected + delta) % n_tgt if tgt_closed else expected + delta
+            if not tgt_closed and not (0 <= j0 < n_tgt - 1):
+                continue
+            j1 = (j0 + 1) % n_tgt
+            a = tgt_core[j0]
+            b = tgt_core[j1]
+            distance_sq, alpha = point_segment_distance_sq(
+                float(p[0]), float(p[1]), a, b
+            )
+            if best is None or distance_sq < best[0]:
+                best = (
+                    distance_sq,
+                    [
+                        float(a[0]) + alpha * (float(b[0]) - float(a[0])),
+                        float(a[1]) + alpha * (float(b[1]) - float(a[1])),
+                        float(a[2]) + alpha * (float(b[2]) - float(a[2])),
+                    ],
+                )
+
+        if best is None:
+            result.append(list(tgt_core[expected]))
+        else:
+            result.append(best[1])
+
+    if ref_closed and result:
+        result.append(list(result[0]))
+    return result
+
+
+def blend_aligned_lane_pair(
+    reference: list[list[float]],
+    target: list[list[float]],
+    weight_target: float,
+) -> list[list[float]]:
+    aligned_target = align_target_to_reference(reference, target)
+    return blend_paths(reference, aligned_target, weight_target)
+
+
+def build_open_road_lane_geometry(
+    lane_loops: dict[str, list[list[float]]],
+    sample_count: int = 1600,
+) -> OpenRoadLaneGeometry:
+    """Build a smooth six-lane replay map from measured lane-center loops.
+
+    The six JSON trajectories are authoritative lane centers. Painted dividers
+    are approximated geometrically between neighboring centers. Outer edges are
+    extrapolated half a lane spacing, yielding +/-12 m on the calibrated
+    straight. Median-side edges are interpolated to +/-0.6 m on that straight.
+
+    Each lane is independently resampled by distance, then neighboring lanes are
+    locally aligned before interpolation. This avoids phase error in curves when
+    the inside and outside lanes have different total lap lengths.
+    """
+    required = tuple(OPEN_ROAD_LANE_REFERENCE_FILES)
+    missing = [name for name in required if name not in lane_loops]
+    if missing:
+        raise ValueError(f"Missing Open Road lane reference(s): {', '.join(missing)}")
+
+    centers = {
+        name: resample_polyline_by_distance_fraction(lane_loops[name], sample_count)
+        for name in required
+    }
+
+    ur = centers["upper_right"]
+    um = centers["upper_middle"]
+    ul = centers["upper_left"]
+    lr = centers["lower_right"]
+    lm = centers["lower_middle"]
+    ll = centers["lower_left"]
+
+    # Pair each neighboring lane spatially, not just by normalized arc length.
+    um_on_ur = align_target_to_reference(ur, um)
+    ul_on_um = align_target_to_reference(um, ul)
+    lm_on_lr = align_target_to_reference(lr, lm)
+    ll_on_lm = align_target_to_reference(lm, ll)
+    lr_on_ul = align_target_to_reference(ul, lr)
+
+    dividers = {
+        "upper_right_middle": blend_paths(ur, um_on_ur, 0.5),
+        "upper_middle_left": blend_paths(um, ul_on_um, 0.5),
+        "lower_right_middle": blend_paths(lr, lm_on_lr, 0.5),
+        "lower_middle_left": blend_paths(lm, ll_on_lm, 0.5),
+    }
+
+    # The calibrated straight has inner lane centers at +2 and -2 m. The
+    # median-side pavement edges are +/-0.6 m, i.e. 35% and 65% across that gap.
+    median_upper_weight = (2.0 - OPEN_ROAD_MEDIAN_HALF_WIDTH_M) / 4.0  # 0.35
+    median_lower_weight = (2.0 + OPEN_ROAD_MEDIAN_HALF_WIDTH_M) / 4.0  # 0.65
+    median_edges = {
+        "upper": blend_paths(ul, lr_on_ul, median_upper_weight),
+        "lower": blend_paths(ul, lr_on_ul, median_lower_weight),
+    }
+    median_center = blend_paths(ul, lr_on_ul, 0.5)
+
+    # Extend the outermost lane center by half the measured adjacent-lane vector.
+    outer_edges = {
+        "upper": extrapolate_from_neighbor(ur, um_on_ur, 0.5),
+        "lower": extrapolate_from_neighbor(ll_on_lm, lm, 0.5),
+    }
+
+    return OpenRoadLaneGeometry(
+        lane_centers=centers,
+        lane_dividers=dividers,
+        outer_edges=outer_edges,
+        median_edges=median_edges,
+        median_center=median_center,
+    )
+
+def load_open_road_six_lane_geometry(
+    reference_path: Path,
+    sample_count: int = 1600,
+) -> OpenRoadLaneGeometry | None:
+    """Load all six lane JSONs beside the base reference, or return None."""
+    files = find_open_road_lane_reference_files(reference_path)
+    if not files:
+        return None
+
+    loops: dict[str, list[list[float]]] = {}
+    for name, path in files.items():
+        _document, raw = load_open_road_reference(path)
+        loop, info = extract_stable_completed_loop(raw, seam_lead_in_m=0.0)
+        if not info.get("closed"):
+            raise ValueError(f"Lane reference {path.name} does not contain a complete loop.")
+        loops[name] = loop
+    return build_open_road_lane_geometry(loops, sample_count=sample_count)

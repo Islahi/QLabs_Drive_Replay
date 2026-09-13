@@ -1,0 +1,111 @@
+{
+  "format": "qlabs_drive_session",
+  "version": 2,
+  "workspace": "Open Road",
+  "session_id": "2026-09-10_210721_upper_middle_lane",
+  "status": "complete",
+  "created_utc": "2026-09-10T18:07:21.608036+00:00",
+  "recording_started_utc": "2026-09-10T18:07:21.834166+00:00",
+  "finished_utc": "2026-09-10T19:13:56.362761+00:00",
+  "timebase": {
+    "kind": "obs_aligned_monotonic_seconds",
+    "column": "time_s",
+    "description": "Seconds from the estimated first OBS-recorded video frame. Telemetry may begin slightly after t=0 while startup completes.",
+    "obs_duration_at_first_status_s": 0.0
+  },
+  "source": {
+    "kind": "qlabs_qcar2_world_transform",
+    "host": "localhost",
+    "actor_number": 0
+  },
+  "telemetry": {
+    "file": "location.csv",
+    "columns": [
+      "time_s",
+      "scheduled_time_s",
+      "x",
+      "y",
+      "z",
+      "roll_rad",
+      "pitch_rad",
+      "yaw_rad",
+      "valid"
+    ],
+    "requested_sample_rate_hz": 20.0,
+    "sample_count": 79890,
+    "dropped_samples": 0,
+    "duration_s": 3994.528443
+  },
+  "videos": {
+    "qlabs_front": {
+      "kind": "obs_qlabs_window",
+      "label": "QLabs Front (OBS)",
+      "path": "C:/Users/quanser/Videos/2026-09-10 21-07-21.mp4",
+      "sync_file": "obs_sync.csv",
+      "preferred": true
+    },
+    "csi_left": {
+      "kind": "qlabs_csi_camera",
+      "label": "Left CSI",
+      "file": "csi_left.mp4",
+      "frame_timestamps_file": "csi_left_frames.csv",
+      "camera": "left",
+      "requested_fps": 15.0,
+      "frame_count": 0,
+      "duplicate_frames": 0,
+      "failed_requests": 0,
+      "first_session_time_s": null,
+      "last_session_time_s": null
+    },
+    "csi_right": {
+      "kind": "qlabs_csi_camera",
+      "label": "Right CSI",
+      "file": "csi_right.mp4",
+      "frame_timestamps_file": "csi_right_frames.csv",
+      "camera": "right",
+      "requested_fps": 15.0,
+      "frame_count": 0,
+      "duplicate_frames": 0,
+      "failed_requests": 0,
+      "first_session_time_s": null,
+      "last_session_time_s": null
+    },
+    "csi_rear": {
+      "kind": "qlabs_csi_camera",
+      "label": "Rear CSI",
+      "file": "csi_rear.mp4",
+      "frame_timestamps_file": "csi_rear_frames.csv",
+      "camera": "rear",
+      "requested_fps": 15.0,
+      "frame_count": 0,
+      "duplicate_frames": 0,
+      "failed_requests": 0,
+      "first_session_time_s": null,
+      "last_session_time_s": null
+    }
+  },
+  "replay": {
+    "heading_source": "derived_from_consecutive_xy_samples"
+  },
+  "qlabs": {
+    "host": "localhost",
+    "source_actor_number": 0
+  },
+  "recorder": {
+    "kind": "one_button_obs_qlabs",
+    "qlabs_front_view": true,
+    "additional_cameras": [
+      "left",
+      "right",
+      "rear"
+    ],
+    "additional_camera_fps": 15.0
+  },
+  "obs": {
+    "host": "localhost",
+    "port": 4455,
+    "sync_file": "obs_sync.csv",
+    "recording_path": "C:/Users/quanser/Videos/2026-09-10 21-07-21.mp4",
+    "sync_samples": 3964
+  }
+}

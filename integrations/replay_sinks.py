@@ -133,10 +133,24 @@ class VideoReplaySink(ReplaySink):
                         "video_time_s",
                     )
 
+                analysis_origin_s = float(getattr(session, "analysis_start_s", 0.0))
+                if sync_points and analysis_origin_s > 0.0:
+                    # Sync CSV uses raw session time; replay clock uses trimmed
+                    # analysis time. Shift only the sync X-axis, never video time.
+                    sync_points = [
+                        (session_t - analysis_origin_s, video_t)
+                        for session_t, video_t in sync_points
+                    ]
+                base_offset = float(metadata.get("offset_s", 0.0))
+                if not sync_points:
+                    # Without a measured sync curve, raw video t equals raw
+                    # session t, so the non-destructive trim is a simple offset.
+                    base_offset += analysis_origin_s
+
                 sources[str(key)] = {
                     "label": str(metadata.get("label", key)),
                     "path": path,
-                    "offset_s": float(metadata.get("offset_s", 0.0)),
+                    "offset_s": base_offset,
                     "sync_points": sync_points,
                 }
                 if metadata.get("preferred"):
@@ -151,7 +165,7 @@ class VideoReplaySink(ReplaySink):
                 sources["legacy"] = {
                     "label": "Session video",
                     "path": path,
-                    "offset_s": float(legacy.get("offset_s", 0.0)),
+                    "offset_s": float(legacy.get("offset_s", 0.0)) + float(getattr(session, "analysis_start_s", 0.0)),
                     "sync_points": [],
                 }
                 preferred_key = "legacy"

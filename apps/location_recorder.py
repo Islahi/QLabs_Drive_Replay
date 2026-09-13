@@ -125,6 +125,53 @@ class RecorderWindow(QMainWindow):
         camera_note.setWordWrap(True)
         camera_layout.addWidget(camera_note, 2, 0, 1, 3)
 
+        alignment_group = QGroupBox("Replay start alignment (non-destructive)")
+        alignment_form = QFormLayout(alignment_group)
+        layout.addWidget(alignment_group)
+
+        self.auto_trim_check = QCheckBox(
+            "Automatically start replay at the first sustained vehicle movement"
+        )
+        self.auto_trim_check.setChecked(True)
+        self.auto_trim_check.setToolTip(
+            "Raw videos and location.csv are never cut. The detected start time is saved "
+            "in session.json and used only by the replay timeline."
+        )
+        alignment_form.addRow(self.auto_trim_check)
+
+        self.motion_threshold_spin = QDoubleSpinBox()
+        self.motion_threshold_spin.setRange(0.05, 5.0)
+        self.motion_threshold_spin.setDecimals(2)
+        self.motion_threshold_spin.setSingleStep(0.05)
+        self.motion_threshold_spin.setValue(0.30)
+        self.motion_threshold_spin.setSuffix(" m/s")
+        alignment_form.addRow("Motion threshold", self.motion_threshold_spin)
+
+        self.required_motion_spin = QDoubleSpinBox()
+        self.required_motion_spin.setRange(0.2, 10.0)
+        self.required_motion_spin.setDecimals(1)
+        self.required_motion_spin.setValue(1.5)
+        self.required_motion_spin.setSuffix(" s")
+        alignment_form.addRow("Must keep moving for", self.required_motion_spin)
+
+        self.pre_roll_spin = QDoubleSpinBox()
+        self.pre_roll_spin.setRange(0.0, 10.0)
+        self.pre_roll_spin.setDecimals(1)
+        self.pre_roll_spin.setValue(0.0)
+        self.pre_roll_spin.setSuffix(" s")
+        self.pre_roll_spin.setToolTip(
+            "0 s makes every aligned replay begin at detected movement. Increase only if "
+            "you want to retain a short view before the car starts."
+        )
+        alignment_form.addRow("Pre-roll before movement", self.pre_roll_spin)
+
+        alignment_note = QLabel(
+            "Recommended for multi-driver comparison: enabled, 0.30 m/s, 1.5 s sustained, "
+            "0.0 s pre-roll. This removes only the replay's initial waiting period; raw files remain intact."
+        )
+        alignment_note.setWordWrap(True)
+        alignment_form.addRow(alignment_note)
+
         session_group = QGroupBox("Session")
         session_form = QFormLayout(session_group)
         layout.addWidget(session_group)
@@ -217,6 +264,10 @@ class RecorderWindow(QMainWindow):
                 obs_password=self.obs_password_edit.text(),
                 camera_keys=self.selected_cameras(),
                 camera_fps=self.camera_fps_spin.value(),
+                auto_trim_stationary_start=self.auto_trim_check.isChecked(),
+                motion_threshold_mps=self.motion_threshold_spin.value(),
+                required_motion_s=self.required_motion_spin.value(),
+                pre_roll_s=self.pre_roll_spin.value(),
             )
             self.worker.start()
         except Exception as exc:
@@ -225,8 +276,8 @@ class RecorderWindow(QMainWindow):
 
         self.record_button.setText("STOP SESSION")
         self.status_label.setText(
-            "Starting synchronized session: checking QLabs, forcing front camera, "
-            "starting OBS, then telemetry/cameras…"
+            "Starting synchronized session: checking QLabs, preflighting selected CSI cameras/MP4 encoder, "
+            "forcing front camera, then starting OBS + telemetry + cameras…"
         )
         self.poll_timer.start()
 
@@ -283,10 +334,24 @@ class RecorderWindow(QMainWindow):
                     f"Session folder: {self.worker.session_dir}"
                 )
             else:
+                analysis = state.get("analysis", {})
+                align_note = ""
+                if analysis.get("status") == "detected":
+                    align_note = (
+                        f"\nReplay alignment: raw t={float(analysis.get('analysis_start_s', 0.0)):.2f} s "
+                        "becomes replay 00:00.000"
+                    )
+                elif analysis.get("status") == "disabled":
+                    align_note = "\nReplay alignment: disabled (raw start retained)"
+                warnings = state.get("warnings", [])
+                warning_note = ""
+                if warnings:
+                    warning_note = "\nWarnings: " + " | ".join(str(w) for w in warnings)
                 self.status_label.setText(
                     f"Session complete: {state['sample_count']:,} telemetry samples\n"
                     f"Session folder: {self.worker.session_dir}\n"
                     f"OBS file: {state.get('obs_output_path') or 'path not reported by OBS'}"
+                    f"{align_note}{warning_note}"
                 )
 
     def closeEvent(self, event) -> None:

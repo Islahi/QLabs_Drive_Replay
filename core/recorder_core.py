@@ -12,7 +12,7 @@ import threading
 import time
 
 from core.oop_interfaces import LocationSource
-from core.replay_core import new_session_document, utc_now_iso, write_json_atomic
+from core.replay_core import detect_sustained_motion_start, new_session_document, utc_now_iso, write_json_atomic
 
 
 class RecorderWorker:
@@ -164,7 +164,6 @@ class RecorderWorker:
                 error = self.error
                 self.finished = True
 
-            self.document["status"] = "error" if error else "complete"
             self.document["finished_utc"] = utc_now_iso()
             telemetry = self.document["telemetry"]
             telemetry["sample_count"] = sample_count
@@ -173,6 +172,36 @@ class RecorderWorker:
             if error:
                 self.document["error"] = error
             write_json_atomic(self.session_dir / "session.json", self.document)
+
+
+def _detect_motion_start_from_csv(
+    csv_path: Path,
+    threshold_mps: float,
+    required_motion_s: float,
+) -> float | None:
+    times: list[float] = []
+    xs: list[float] = []
+    ys: list[float] = []
+    if not Path(csv_path).is_file():
+        return None
+    with Path(csv_path).open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                t = float(row["time_s"])
+                x = float(row["x"])
+                y = float(row["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            times.append(t)
+            xs.append(x)
+            ys.append(y)
+    return detect_sustained_motion_start(
+        times, xs, ys,
+        threshold_mps=threshold_mps,
+        required_motion_s=required_motion_s,
+        speed_window_s=0.50,
+    )
 
 
 class SessionRecorderWorker:
@@ -193,6 +222,10 @@ class SessionRecorderWorker:
         obs_password: str = "",
         camera_keys: tuple[str, ...] = ("left", "right", "rear"),
         camera_fps: float = 15.0,
+        auto_trim_stationary_start: bool = True,
+        motion_threshold_mps: float = 0.30,
+        required_motion_s: float = 1.5,
+        pre_roll_s: float = 0.0,
     ) -> None:
         from integrations.recording_services import OBSRecordingController
 
@@ -204,6 +237,10 @@ class SessionRecorderWorker:
         self.sample_period_s = 1.0 / self.sample_rate_hz
         self.camera_keys = tuple(dict.fromkeys(camera_keys))
         self.camera_fps = float(camera_fps)
+        self.auto_trim_stationary_start = bool(auto_trim_stationary_start)
+        self.motion_threshold_mps = max(0.0, float(motion_threshold_mps))
+        self.required_motion_s = max(0.0, float(required_motion_s))
+        self.pre_roll_s = max(0.0, float(pre_roll_s))
 
         self.obs = OBSRecordingController(
             host=obs_host,
@@ -212,7 +249,9 @@ class SessionRecorderWorker:
             timeout_s=3.0,
         )
         self.obs_sync_logger = None
-        self.camera_recorders = []
+        self.camera_recorder = None
+        self.camera_preflight: dict[str, dict] = {}
+        self.warnings: list[str] = []
 
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
@@ -239,6 +278,18 @@ class SessionRecorderWorker:
             "qlabs_front_view": True,
             "additional_cameras": list(self.camera_keys),
             "additional_camera_fps": self.camera_fps,
+            "camera_capture_mode": "single_connection_sequential",
+        }
+        self.document["analysis"] = {
+            "auto_trim_stationary_start": self.auto_trim_stationary_start,
+            "non_destructive": True,
+            "motion_threshold_mps": self.motion_threshold_mps,
+            "required_motion_s": self.required_motion_s,
+            "speed_window_s": 0.50,
+            "pre_roll_s": self.pre_roll_s,
+            "detected_motion_start_s": None,
+            "analysis_start_s": 0.0,
+            "status": "pending" if self.auto_trim_stationary_start else "disabled",
         }
         self.document["obs"] = {
             "host": obs_host,
@@ -278,10 +329,21 @@ class SessionRecorderWorker:
 
     def snapshot(self) -> dict:
         with self.lock:
-            camera_states = {
-                recorder.camera_key: recorder.snapshot()
-                for recorder in tuple(self.camera_recorders)
-            }
+            if self.camera_recorder is not None:
+                camera_states = self.camera_recorder.snapshot()
+            else:
+                camera_states = {
+                    key: {
+                        "label": key.title(),
+                        "frame_count": 0,
+                        "duplicate_count": 0,
+                        "failed_requests": 0,
+                        "error": None,
+                        "ready": False,
+                        "preflight": self.camera_preflight.get(key),
+                    }
+                    for key in self.camera_keys
+                }
             return {
                 "sample_count": self.sample_count,
                 "dropped_samples": self.dropped_samples,
@@ -292,10 +354,13 @@ class SessionRecorderWorker:
                 "obs_recording": self.obs_recording,
                 "obs_output_path": self.obs_output_path,
                 "cameras": camera_states,
+                "camera_preflight": dict(self.camera_preflight),
+                "warnings": list(self.warnings),
+                "analysis": dict(self.document.get("analysis", {})),
             }
 
     def _run(self) -> None:
-        from integrations.recording_services import OBSStatusLogger, QLabsCameraRecorder
+        from integrations.recording_services import OBSStatusLogger, QLabsMultiCameraRecorder
 
         csv_path = self.session_dir / "location.csv"
         started_utc = None
@@ -309,7 +374,21 @@ class SessionRecorderWorker:
             if callable(possess_front):
                 possess_front()
 
-            # 2) Authenticate with OBS and refuse to start if OBS is already
+            # 2) Preflight every selected Python camera BEFORE OBS starts.
+            # This verifies QLabs image acquisition and MP4 encoding, and refuses
+            # the experiment if get_image() blocks or returns unusable data.
+            if self.camera_keys:
+                self.camera_preflight = QLabsMultiCameraRecorder.preflight_cameras(
+                    host=str(self.source.metadata.get("host", "localhost")),
+                    actor_number=int(self.source.metadata.get("actor_number", 0)),
+                    camera_keys=self.camera_keys,
+                    session_dir=self.session_dir,
+                    timeout_s=max(8.0, 4.0 * len(self.camera_keys)),
+                )
+                self.document["recorder"]["camera_preflight"] = self.camera_preflight
+                write_json_atomic(self.session_dir / "session.json", self.document)
+
+            # 3) Authenticate with OBS and refuse to start if OBS is already
             # recording, then align the session clock to OBS video t=0.
             self.obs.connect()
             session_zero_wall, obs_status = self.obs.start_and_estimate_video_zero()
@@ -332,19 +411,19 @@ class SessionRecorderWorker:
             )
             self.obs_sync_logger.start()
 
-            # 4) Optional extra camera videos. Their sidecar files record the
-            # exact session time represented by each encoded frame.
-            for camera_key in self.camera_keys:
-                recorder = QLabsCameraRecorder(
+            # 5) Optional extra camera videos. One worker owns one QLabs
+            # connection and requests Left/Right/Rear sequentially.
+            if self.camera_keys:
+                self.camera_recorder = QLabsMultiCameraRecorder(
                     host=str(self.source.metadata.get("host", "localhost")),
                     actor_number=int(self.source.metadata.get("actor_number", 0)),
-                    camera_key=camera_key,
+                    camera_keys=self.camera_keys,
                     session_dir=self.session_dir,
                     session_zero_wall=session_zero_wall,
                     fps=self.camera_fps,
+                    preflight=self.camera_preflight,
                 )
-                self.camera_recorders.append(recorder)
-                recorder.start()
+                self.camera_recorder.start()
 
             # 5) Unfiltered fixed-rate telemetry. time_s is actual capture time;
             # scheduled_time_s is useful for diagnosing loop jitter.
@@ -401,6 +480,33 @@ class SessionRecorderWorker:
                     with self.lock:
                         self.elapsed_s = max(self.elapsed_s, t)
 
+                    # Never allow another long experiment to continue silently
+                    # with dead CSI recording. Preflight catches startup faults;
+                    # this watchdog catches a worker that stalls after OBS starts.
+                    if self.camera_recorder is not None and t >= 6.0:
+                        camera_state = self.camera_recorder.snapshot()
+                        for camera_key, info in camera_state.items():
+                            camera_error = info.get("error")
+                            if camera_error:
+                                raise RuntimeError(
+                                    f"{info.get('label', camera_key)} recording failed: {camera_error}"
+                                )
+                            frame_count = int(info.get("frame_count", 0))
+                            last_session_time = info.get("last_session_time_s")
+                            if frame_count <= 0:
+                                raise RuntimeError(
+                                    f"{info.get('label', camera_key)} produced no video frames "
+                                    "within the first 6 seconds after recording started."
+                                )
+                            if (
+                                last_session_time is not None
+                                and t - float(last_session_time) > 6.0
+                            ):
+                                raise RuntimeError(
+                                    f"{info.get('label', camera_key)} has not produced a frame "
+                                    f"for {t - float(last_session_time):.1f} seconds."
+                                )
+
                     now = time.perf_counter()
                     if now - last_flush_wall >= 1.0:
                         handle.flush()
@@ -423,11 +529,11 @@ class SessionRecorderWorker:
         finally:
             # Stop secondary writers before OBS so all sources share as much of
             # the same time range as possible.
-            for recorder in tuple(self.camera_recorders):
+            if self.camera_recorder is not None:
                 try:
-                    recorder.stop()
-                except Exception:
-                    pass
+                    self.camera_recorder.stop()
+                except Exception as exc:
+                    self.warnings.append(f"Camera stop failed: {exc}")
 
             if self.obs_sync_logger is not None:
                 try:
@@ -480,9 +586,54 @@ class SessionRecorderWorker:
                 if self.obs_sync_logger.error:
                     self.document["obs"]["sync_error"] = self.obs_sync_logger.error
 
-            for recorder in tuple(self.camera_recorders):
-                self.document["videos"][f"csi_{recorder.camera_key}"] = recorder.video_metadata()
+            if self.camera_recorder is not None:
+                camera_metadata = self.camera_recorder.video_metadata()
+                for key, metadata in camera_metadata.items():
+                    self.document["videos"][key] = metadata
+                    if metadata.get("status") != "complete":
+                        self.warnings.append(
+                            f"{metadata.get('label', key)}: {metadata.get('error') or 'recording failed'}"
+                        )
 
+            # Non-destructive setup-wait removal: only metadata/replay origin is
+            # changed. location.csv and every video file stay byte-for-byte raw.
+            analysis = self.document.get("analysis", {})
+            if self.auto_trim_stationary_start and csv_path.is_file():
+                try:
+                    motion_start = _detect_motion_start_from_csv(
+                        csv_path,
+                        threshold_mps=self.motion_threshold_mps,
+                        required_motion_s=self.required_motion_s,
+                    )
+                    if motion_start is None:
+                        analysis["status"] = "no_sustained_motion_detected"
+                        analysis["analysis_start_s"] = 0.0
+                        self.warnings.append(
+                            "Automatic replay start alignment was enabled, but no sustained motion was detected."
+                        )
+                    else:
+                        analysis["detected_motion_start_s"] = round(float(motion_start), 6)
+                        analysis_start = max(0.0, float(motion_start) - self.pre_roll_s)
+                        analysis["analysis_start_s"] = round(analysis_start, 6)
+                        analysis["status"] = "detected"
+                except Exception as exc:
+                    analysis["status"] = "error"
+                    analysis["analysis_start_s"] = 0.0
+                    analysis["error"] = str(exc)
+                    self.warnings.append(f"Replay start alignment failed: {exc}")
+            elif not self.auto_trim_stationary_start:
+                analysis["status"] = "disabled"
+                analysis["analysis_start_s"] = 0.0
+            self.document["analysis"] = analysis
+
+            # A camera failure is visible in session status even if telemetry/OBS
+            # completed, avoiding the previous misleading status='complete'.
             if error:
+                self.document["status"] = "error"
                 self.document["error"] = error
+            elif self.warnings:
+                self.document["status"] = "complete_with_recording_warnings"
+                self.document["warnings"] = list(dict.fromkeys(self.warnings))
+            else:
+                self.document["status"] = "complete"
             write_json_atomic(self.session_dir / "session.json", self.document)
